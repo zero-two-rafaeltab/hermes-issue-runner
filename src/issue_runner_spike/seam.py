@@ -18,9 +18,13 @@ from typing import Any
 class SeamProbe:
     hermes_source: str
     discord_adapter_found: bool
+    base_platform_adapter_found: bool
     gateway_runner_found: bool
     stream_consumer_found: bool
     private_discord_thread_flow_found: bool
+    base_create_handoff_thread_found: bool
+    discord_create_handoff_thread_found: bool
+    gateway_process_handoff_found: bool
     public_start_child_session_found: bool
     conclusion: str
 
@@ -36,10 +40,12 @@ def inspect_hermes_source(root: str | Path) -> SeamProbe:
     """Inspect a Hermes source checkout for the Discord child-session seam."""
     base = Path(root).expanduser().resolve()
     discord_adapter = base / "plugins" / "platforms" / "discord" / "adapter.py"
+    base_adapter = base / "gateway" / "platforms" / "base.py"
     gateway_run = base / "gateway" / "run.py"
     stream_consumer = base / "gateway" / "stream_consumer.py"
 
     adapter_text = _read(discord_adapter)
+    base_adapter_text = _read(base_adapter)
     gateway_text = _read(gateway_run)
     stream_text = _read(stream_consumer)
 
@@ -52,11 +58,19 @@ def inspect_hermes_source(root: str | Path) -> SeamProbe:
             "await self.handle_message(event)",
         )
     )
-    public_seam = "start_child_session" in gateway_text or "start_child_session" in adapter_text
+    base_handoff = "async def create_handoff_thread" in base_adapter_text
+    discord_handoff = "async def create_handoff_thread" in adapter_text
+    gateway_handoff = "async def _process_handoff" in gateway_text
+    public_seam = "def start_child_session" in gateway_text or "async def start_child_session" in gateway_text
     streaming = "class GatewayStreamConsumer" in stream_text and "stream_delta_callback" in stream_text
 
     if public_seam:
         conclusion = "public child-session seam appears to exist"
+    elif base_handoff or discord_handoff or gateway_handoff:
+        conclusion = (
+            "existing handoff machinery found, but public plugin child-session seam is missing; "
+            "handoff is CLI/home-channel oriented rather than an invoking-channel plugin API"
+        )
     elif private_flow and streaming:
         conclusion = "private Discord thread/session flow exists; public plugin seam is missing"
     else:
@@ -65,9 +79,13 @@ def inspect_hermes_source(root: str | Path) -> SeamProbe:
     return SeamProbe(
         hermes_source=str(base),
         discord_adapter_found=discord_adapter.is_file(),
+        base_platform_adapter_found=base_adapter.is_file(),
         gateway_runner_found=gateway_run.is_file(),
         stream_consumer_found=stream_consumer.is_file(),
         private_discord_thread_flow_found=private_flow,
+        base_create_handoff_thread_found=base_handoff,
+        discord_create_handoff_thread_found=discord_handoff,
+        gateway_process_handoff_found=gateway_handoff,
         public_start_child_session_found=public_seam,
         conclusion=conclusion,
     )

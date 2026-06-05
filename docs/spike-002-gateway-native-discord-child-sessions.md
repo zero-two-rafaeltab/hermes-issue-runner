@@ -29,9 +29,13 @@ Relevant current code paths:
   - `_handle_thread_create_slash()` already creates a thread and dispatches a Hermes session when a starter message is supplied.
   - `_create_thread()` encapsulates Discord thread creation for a native interaction.
   - `_dispatch_thread_session()` constructs a thread-targeted `MessageEvent` and calls `self.handle_message(event)`.
+  - `create_handoff_thread()` implements the existing handoff thread helper for Discord.
   - `send(chat_id, content, metadata={"thread_id": ...})` routes responses to a Discord thread.
+- `gateway/platforms/base.py`
+  - `BasePlatformAdapter.create_handoff_thread()` defines the adapter hook for handoff destinations.
 - `gateway/run.py`
   - `_handle_message()` owns authorization, session lookup/creation, and dispatch.
+  - `_process_handoff()` consumes existing handoff rows and asks adapters to create handoff threads.
   - `_run_agent()` creates the normal streamed gateway turn.
   - Streaming uses `GatewayStreamConsumer` and platform metadata to progressively send/edit Discord messages.
 - `gateway/stream_consumer.py`
@@ -57,6 +61,19 @@ _handle_thread_create_slash(interaction, name, message)
 
 That means Hermes core/adapter code already knows how to create a thread and launch a normal gateway-handled session in it.
 
+### Existing handoff machinery exists, but is not the needed plugin seam
+
+Source inspection also finds `BasePlatformAdapter.create_handoff_thread()`, Discord
+`create_handoff_thread()`, and `GatewayRunner._process_handoff()`. This is
+important existing machinery, but it is designed for queued CLI/home-channel
+handoff workflows. It is not currently a stable plugin API for: take this
+invoking Discord event, create a child destination under the invoking channel,
+authorize the invoking user through the normal gateway policy, start a streamed
+child session there, and return identifiers/ack data to the plugin. The proposed
+issue-runner seam should reuse this machinery where appropriate rather than
+ignore it, but the machinery alone does not satisfy issue #2's plugin-facing API
+requirement.
+
 ### Normal live streaming should be preserved when dispatch goes through gateway `handle_message`
 
 If the child session is started by constructing a `MessageEvent` and entering the same gateway handling path as an inbound Discord message, it reaches the same `GatewayStreamConsumer` used by ordinary Discord turns. That is the required route for live progress/tool-call output. A standalone script or direct `AIAgent.chat()` call would **not** prove the required UX.
@@ -71,11 +88,11 @@ A plugin can catch a text trigger through `pre_gateway_dispatch`, but there is n
 
 A plugin can reach private internals (`event.raw_message.create_thread`, `gateway._handle_message`, Discord adapter private methods), but relying on those internals would be brittle and would bypass/duplicate core authorization/session semantics unless very carefully mirrored.
 
-The already-existing adapter-private `/thread` path demonstrates the product is feasible, but it is not yet exposed as a stable plugin/hook surface.
+The already-existing adapter-private `/thread` path and handoff helpers demonstrate the product is feasible, but they are not yet exposed as a stable invoking-channel plugin/child-session surface.
 
 ## Minimal Hermes core extension required
 
-Expose a gateway service method with this shape (names illustrative):
+Expose a gateway service method with this shape (names illustrative; the prototype may need adaptation once the final core seam lands):
 
 ```python
 @dataclass(frozen=True)
@@ -138,6 +155,11 @@ async def pre_gateway_dispatch(event, gateway, session_store):
     if not is_issue_runner_trigger(event):
         return None
 
+    if not gateway.is_authorized_for_child_session(event):  # illustrative helper
+        # pre_gateway_dispatch runs before normal authorization; do not consume
+        # unauthorized messages or bypass pairing/allowlist behavior.
+        return None
+
     result = await gateway.start_child_session(
         GatewayChildSessionRequest(
             parent_event=event,
@@ -162,7 +184,9 @@ async def pre_gateway_dispatch(event, gateway, session_store):
 It intentionally behaves conservatively:
 
 - If a future `gateway.start_child_session()` seam exists, it calls that.
-- Otherwise it returns a clear diagnostic explaining that the stable core seam is missing.
+- It checks `gateway._is_user_authorized(event.source)` when that private helper is available before calling the future seam, so unauthorized triggers are not consumed by the pre-dispatch hook. The future public seam must still enforce authorization itself.
+- Otherwise it sends a visible Discord diagnostic through the platform adapter when available, explaining that the stable core seam is missing; if no adapter send path is available, it returns `None` rather than silently dropping the trigger.
+- For non-Discord triggers, it returns `None` and avoids invisible diagnostics.
 - It does not claim success or fabricate Discord evidence.
 
 This provides a durable plugin-shaped artifact without depending on private Hermes internals for production behavior.
