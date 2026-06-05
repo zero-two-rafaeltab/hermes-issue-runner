@@ -24,6 +24,29 @@ Short version:
 ## Local smoke checks
 
 ```bash
-python -m src.issue_runner_spike.seam --hermes-source ~/.hermes/hermes-agent --json
-python -m unittest discover -s tests
+python3 -m src.issue_runner_spike.seam --hermes-source "${HERMES_SOURCE:-$HOME/.hermes/hermes-agent}" --json
+python3 -m unittest discover -s tests
 ```
+
+`tests/test_seam.py` uses `HERMES_SOURCE` when set, defaults to
+`~/.hermes/hermes-agent`, and skips the local source-inspection assertion when
+that checkout is absent.
+
+## Manual prototype enablement for Rafael
+
+The plugin API shape in this spike is illustrative: the prototype may need small
+adaptations once Hermes core lands a supported child-session seam.
+
+For a throwaway local check, copy or symlink `plugins/issue_runner_spike/` into
+the active Hermes profile plugin directory, enable it in the profile config, and
+restart the gateway with Discord configured. Then run this from an authorized
+Discord channel:
+
+```text
+/issue-runner-spike inspect the current repository, run a harmless command, and summarize
+```
+
+Until `gateway.start_child_session(...)` exists, the prototype only consumes the
+trigger when it can send a visible Discord diagnostic/ack through the Discord
+adapter; it does not claim live child-session proof or emit invisible diagnostics
+for other platforms.
