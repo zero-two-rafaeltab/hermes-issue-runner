@@ -1,0 +1,6 @@
+name: issue_runner_spike
+version: 0.1.0
+description: Technical spike plugin for Discord child-session seam discovery.
+kind: standalone
+provides_hooks:
+  - pre_gateway_dispatch
