@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 from .branch_prep import plan_branch_preparation
 from .child_run import prepare_child_run, start_child_issue_session
 from .selection import IssueKey, select_next_child
-from .state import check_duplicate_run, ensure_operational_labels, mark_child_done, mark_child_started
+from .state import check_duplicate_run, clear_child_started, ensure_operational_labels, mark_child_done, mark_child_started
 
 SLASH_COMMANDS = ("/issue-runner", "/issue_runner")
 START_WORD_RE = re.compile(r"\b(?:start|run|begin)\b", re.IGNORECASE)
@@ -90,7 +90,7 @@ class ParentRunResult:
 
 def _truthy_status(value: Any) -> bool:
     if isinstance(value, str):
-        return value.strip().casefold() in {"approved", "complete", "completed", "done", "agent:done", "success", "succeeded"}
+        return value.strip().casefold() in {"approved", "complete", "completed", "done", "agent:done"}
     return bool(value)
 
 
@@ -98,6 +98,10 @@ def _value_from_result(result: Any, name: str) -> Any:
     if isinstance(result, dict):
         return result.get(name)
     return getattr(result, name, None)
+
+
+def _child_run_plan(child_run: Any) -> Any:
+    return _value_from_result(child_run, "plan")
 
 
 def _child_run_completed(child_run: Any) -> bool:
@@ -113,14 +117,22 @@ def _child_run_completed(child_run: Any) -> bool:
     for candidate in (child_run, _value_from_result(child_run, "result")):
         if candidate is None:
             continue
-        for name in ("completed", "agent_done", "succeeded", "success"):
+        for name in ("completed_child_issue", "agent_done"):
             value = _value_from_result(candidate, name)
             if value is not None:
                 return _truthy_status(value)
         status = _value_from_result(candidate, "status")
         if status is not None:
-            return _truthy_status(status)
+            return str(status).strip().casefold() in {"agent:done", "child_completed"}
     return False
+
+
+class ChildStartupError(RuntimeError):
+    """Raised when branch prep or child session startup fails after selection."""
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -351,15 +363,6 @@ class StartCommandHandler:
         try:
             issue_payload = await _maybe_await(self._get_issue(command.reference))
             parent = _coerce_parent_issue(command.reference, issue_payload)
-            parent_key = IssueKey(parent.owner, parent.repo, parent.number)
-            await _maybe_await(ensure_operational_labels(parent.owner, parent.repo, self.github_client))
-            duplicate_guard = await check_duplicate_run(parent_key, self.github_client)
-            if duplicate_guard.has_incomplete_state:
-                await _maybe_await(self.reply_sender(event, gateway, duplicate_guard.message))
-                return {"action": "skip", "reason": "duplicate run in progress"}
-            run_result = await self._run_parent_loop(event=event, gateway=gateway, parent=parent)
-            selection = run_result.final_selection
-            child_run = run_result.pending_run or run_result.first_started_run
         except Exception as exc:
             await _maybe_await(
                 self.reply_sender(
@@ -369,6 +372,23 @@ class StartCommandHandler:
                 )
             )
             return {"action": "skip", "reason": "github issue lookup failed"}
+
+        parent_key = IssueKey(parent.owner, parent.repo, parent.number)
+        try:
+            await _maybe_await(ensure_operational_labels(parent.owner, parent.repo, self.github_client))
+            duplicate_guard = await check_duplicate_run(parent_key, self.github_client)
+            if duplicate_guard.has_incomplete_state:
+                await _maybe_await(self.reply_sender(event, gateway, duplicate_guard.message))
+                return {"action": "skip", "reason": "duplicate run in progress"}
+            run_result = await self._run_parent_loop(event=event, gateway=gateway, parent=parent)
+            selection = run_result.final_selection
+            child_run = run_result.pending_run or run_result.first_started_run
+        except ChildStartupError as exc:
+            await _maybe_await(self.reply_sender(event, gateway, str(exc)))
+            return {"action": "skip", "reason": exc.reason}
+        except Exception as exc:
+            await _maybe_await(self.reply_sender(event, gateway, f"Unable to advance parent issue {parent_key.ref}: {exc}"))
+            return {"action": "skip", "reason": "parent run failed"}
         completed_summary = ""
         if run_result.completed_children:
             completed_summary = "\nCompleted child runs: " + ", ".join(f"#{child.number}" for child in run_result.completed_children) + "."
@@ -385,7 +405,7 @@ class StartCommandHandler:
                     + completed_summary
                     + (
                         "\nChild run: started gateway child session "
-                        f"for #{selection.selected.number} on branch {child_run.plan.branch_name}."
+                        f"for #{selection.selected.number} on branch {_child_run_plan(child_run).branch_name}."
                         if selection.has_runnable_child and child_run is not None and run_result.pending_run is not None
                         else ""
                     )
@@ -414,28 +434,60 @@ class StartCommandHandler:
 
     async def _start_selected_child(self, *, event: Any, gateway: Any, parent_key: IssueKey, child: Any) -> Any:
         prepared_plan = prepare_child_run(parent=parent_key, child=child)
-        branch_preparation = await _maybe_await(
-            self.branch_preparer(
-                child=child,
-                child_branch=prepared_plan.branch_name,
-                github_client=self.github_client,
-                git_client=self.git_client,
-                pr_base="main",
+        try:
+            branch_preparation = await _maybe_await(
+                self.branch_preparer(
+                    child=child,
+                    child_branch=prepared_plan.branch_name,
+                    github_client=self.github_client,
+                    git_client=self.git_client,
+                    pr_base="main",
+                )
             )
-        )
-        child_run = await _maybe_await(
-            self.child_session_starter(
-                gateway=gateway,
-                event=event,
-                parent=parent_key,
-                child=child,
-                base_branch=branch_preparation.base_branch,
-                pr_base=branch_preparation.pr_base,
-                branch_preparation=branch_preparation,
-            )
-        )
+        except Exception as exc:
+            raise ChildStartupError(
+                "branch preparation failed",
+                f"Unable to prepare branch for child #{child.number}: {exc}",
+            ) from exc
+
         await _maybe_await(mark_child_started(child, self.github_client))
+        try:
+            child_run = await _maybe_await(
+                self.child_session_starter(
+                    gateway=gateway,
+                    event=event,
+                    parent=parent_key,
+                    child=child,
+                    base_branch=branch_preparation.base_branch,
+                    pr_base=branch_preparation.pr_base,
+                    branch_preparation=branch_preparation,
+                )
+            )
+        except Exception as exc:
+            await _maybe_await(clear_child_started(child, self.github_client))
+            raise ChildStartupError(
+                "child session startup failed",
+                f"Unable to start child session for child #{child.number}; cleaned up in-progress label: {exc}",
+            ) from exc
         return child_run
+
+    async def resume_parent(self, *, event: Any, gateway: Any, parent: IssueKey | IssueReference) -> ParentRunResult:
+        """Re-enter a parent run from fresh GitHub state after a child finishes.
+
+        This continuation path intentionally re-fetches the parent issue and
+        re-runs duplicate checks instead of relying on any in-memory queue from a
+        previous handler invocation.
+        """
+
+        reference = IssueReference(parent.owner, parent.repo, parent.number)
+        issue_payload = await _maybe_await(self._get_issue(reference))
+        parent_issue = _coerce_parent_issue(reference, issue_payload)
+        parent_key = IssueKey(parent_issue.owner, parent_issue.repo, parent_issue.number)
+        await _maybe_await(ensure_operational_labels(parent_issue.owner, parent_issue.repo, self.github_client))
+        duplicate_guard = await check_duplicate_run(parent_key, self.github_client)
+        if duplicate_guard.has_incomplete_state:
+            raise ChildStartupError("duplicate run in progress", duplicate_guard.message)
+        return await self._run_parent_loop(event=event, gateway=gateway, parent=parent_issue)
 
     async def _run_parent_loop(self, *, event: Any, gateway: Any, parent: ParentIssue) -> ParentRunResult:
         """Advance a parent run while child sessions report completion.

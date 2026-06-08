@@ -233,7 +233,7 @@ class StartCommandTests(unittest.TestCase):
             started_children.append(kwargs["child"].number)
             plan = prepare_child_run(parent=kwargs["parent"], child=kwargs["child"])
             if kwargs["child"].number == 8:
-                return SimpleNamespace(plan=plan, completed=True)
+                return SimpleNamespace(plan=plan, completed_child_issue=True)
             return SimpleNamespace(plan=plan)
 
         handler = StartCommandHandler(
@@ -258,6 +258,66 @@ class StartCommandTests(unittest.TestCase):
         self.assertGreaterEqual(github.child_calls.count(("nous", "hermes-issue-runner", 1)), 3)
         self.assertIn("Completed child runs: #8.", replies[0])
         self.assertIn("started gateway child session for #9", replies[0])
+
+    def test_gateway_success_ack_does_not_advance_parent_loop(self) -> None:
+        github = FakeGitHub()
+        github.children = [
+            {"owner": "nous", "repo": "hermes-issue-runner", "number": 8, "title": "First", "body": "", "state": "open", "labels": ["ready-for-agent"]},
+            {"owner": "nous", "repo": "hermes-issue-runner", "number": 9, "title": "Second", "body": "", "state": "open", "labels": ["ready-for-agent"]},
+        ]
+        replies: list[str] = []
+        started_children: list[int] = []
+
+        async def reply_sender(event, gateway, message: str) -> bool:
+            replies.append(message)
+            return True
+
+        async def child_session_starter(**kwargs):
+            started_children.append(kwargs["child"].number)
+            return {"success": True, "plan": prepare_child_run(parent=kwargs["parent"], child=kwargs["child"])}
+
+        handler = StartCommandHandler(
+            github,
+            authorization_checker=lambda event, gateway: True,
+            reply_sender=reply_sender,
+            child_session_starter=child_session_starter,
+        )
+        result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#1"), SimpleNamespace()))
+
+        self.assertEqual(result, {"action": "skip", "reason": "issue-runner child run started", "child": "8"})
+        self.assertEqual(started_children, [8])
+        self.assertEqual(github.add_label_calls, [("nous", "hermes-issue-runner", 8, "agent:in-progress")])
+        self.assertNotIn("Completed child runs", replies[0])
+
+    def test_resume_parent_re_fetches_github_state_and_starts_next_child(self) -> None:
+        github = FakeGitHub()
+        github.children = [
+            {"owner": "nous", "repo": "hermes-issue-runner", "number": 8, "title": "Done child", "body": "", "state": "open", "labels": ["ready-for-agent", "agent:done"]},
+            {"owner": "nous", "repo": "hermes-issue-runner", "number": 9, "title": "Second child", "body": "## Blocked by\n\n- #8\n", "state": "open", "labels": ["ready-for-agent"]},
+        ]
+        started_children: list[int] = []
+
+        async def child_session_starter(**kwargs):
+            started_children.append(kwargs["child"].number)
+            return SimpleNamespace(plan=prepare_child_run(parent=kwargs["parent"], child=kwargs["child"]))
+
+        handler = StartCommandHandler(
+            github,
+            authorization_checker=lambda event, gateway: True,
+            child_session_starter=child_session_starter,
+        )
+        result = asyncio.run(
+            handler.resume_parent(
+                event=self._event("continuation"),
+                gateway=SimpleNamespace(),
+                parent=parse_issue_reference("nous/hermes-issue-runner#1"),
+            )
+        )
+
+        self.assertEqual(started_children, [9])
+        self.assertEqual(result.pending_run.plan.child.number, 9)
+        self.assertEqual(github.calls, [("nous", "hermes-issue-runner", 1), ("nous", "hermes-issue-runner", 8), ("nous", "hermes-issue-runner", 8)])
+        self.assertEqual(github.add_label_calls, [("nous", "hermes-issue-runner", 9, "agent:in-progress")])
 
     def test_parent_run_loop_stops_cleanly_when_all_children_complete(self) -> None:
         github = FakeGitHub()
@@ -313,7 +373,7 @@ class StartCommandTests(unittest.TestCase):
         )
         result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#1"), SimpleNamespace()))
 
-        self.assertEqual(result, {"action": "skip", "reason": "github issue lookup failed"})
+        self.assertEqual(result, {"action": "skip", "reason": "branch preparation failed"})
         self.assertEqual(github.add_label_calls, [])
         self.assertIn("branch prep failed", replies[0])
 
@@ -336,8 +396,9 @@ class StartCommandTests(unittest.TestCase):
         )
         result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#1"), SimpleNamespace()))
 
-        self.assertEqual(result, {"action": "skip", "reason": "github issue lookup failed"})
-        self.assertEqual(github.add_label_calls, [])
+        self.assertEqual(result, {"action": "skip", "reason": "child session startup failed"})
+        self.assertEqual(github.add_label_calls, [("nous", "hermes-issue-runner", 9, "agent:in-progress")])
+        self.assertEqual(github.remove_label_calls, [("nous", "hermes-issue-runner", 9, "agent:in-progress")])
         self.assertIn("session failed", replies[0])
 
     def test_authorized_natural_mention_resolves_same_behavior(self) -> None:

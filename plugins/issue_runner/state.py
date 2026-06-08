@@ -137,9 +137,29 @@ async def mark_child_started(child: GitHubIssue | IssueKey, github_client: Any) 
     await _maybe_await(add_issue_label(key, IN_PROGRESS_LABEL, github_client))
 
 
-async def mark_child_done(child: GitHubIssue | IssueKey, github_client: Any) -> None:
-    """Transition a successfully completed child from in-progress to done."""
+def _missing_label_error(exc: BaseException) -> bool:
+    text = str(exc).casefold()
+    return "not found" in text or "404" in text or "does not exist" in text
+
+
+async def clear_child_started(child: GitHubIssue | IssueKey, github_client: Any) -> None:
+    """Best-effort cleanup for an in-progress marker that may already be absent."""
 
     key = child.key if isinstance(child, GitHubIssue) else child
-    await _maybe_await(remove_issue_label(key, IN_PROGRESS_LABEL, github_client))
+    try:
+        await _maybe_await(remove_issue_label(key, IN_PROGRESS_LABEL, github_client))
+    except Exception as exc:
+        if not _missing_label_error(exc):
+            raise
+
+
+async def mark_child_done(child: GitHubIssue | IssueKey, github_client: Any) -> None:
+    """Transition a successfully completed child from in-progress to done.
+
+    The transition is idempotent with respect to ``agent:in-progress`` so a
+    child that already removed or never had that label can still be marked done.
+    """
+
+    key = child.key if isinstance(child, GitHubIssue) else child
+    await clear_child_started(child, github_client)
     await _maybe_await(add_issue_label(key, DONE_LABEL, github_client))
