@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 from typing import Any
 
-from src.issue_runner.start import StartCommandHandler
+_REPO_SRC = Path(__file__).resolve().parents[2] / "src"
+if _REPO_SRC.exists() and str(_REPO_SRC) not in sys.path:
+    sys.path.insert(0, str(_REPO_SRC))
+
+from issue_runner.start import StartCommandHandler
 
 
 class UnconfiguredGitHubClient:

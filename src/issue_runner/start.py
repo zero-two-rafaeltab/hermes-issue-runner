@@ -19,7 +19,7 @@ ISSUE_REF_RE = re.compile(
     r"(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)#(?P<number>[1-9][0-9]*)"
 )
 GITHUB_ISSUE_URL_RE = re.compile(
-    r"https?://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/issues/(?P<number>[1-9][0-9]*)(?:[#?][^\s>]*)?",
+    r"https?://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/issues/(?P<number>[1-9][0-9]*)(?:[#?][^\s>]*)?(?=$|[\s>])",
     re.IGNORECASE,
 )
 
@@ -42,6 +42,11 @@ class IssueReference:
 @dataclass(frozen=True)
 class StartCommand:
     reference: IssueReference
+    mode: str
+
+
+@dataclass(frozen=True)
+class StartIntent:
     mode: str
 
 
@@ -91,9 +96,23 @@ def parse_issue_reference(text: str) -> IssueReference:
     raise IssueReferenceError("Expected a parent issue reference like owner/repo#1 or a GitHub issue URL.")
 
 
-def _is_slash_start(raw: str) -> bool:
+def _slash_command_parts(raw: str) -> tuple[str, str] | None:
     lowered = raw.lower()
-    return any(lowered == command or lowered.startswith(f"{command} ") for command in SLASH_COMMANDS)
+    for command in SLASH_COMMANDS:
+        if lowered == command:
+            return command, ""
+        if lowered.startswith(f"{command} "):
+            return command, raw[len(command) :].strip()
+    return None
+
+
+def _is_slash_start(raw: str) -> bool:
+    parts = _slash_command_parts(raw)
+    if parts is None:
+        return False
+    _command, remainder = parts
+    first_word = remainder.split(maxsplit=1)[0].lower() if remainder else ""
+    return first_word == "start"
 
 
 def _looks_like_natural_start(raw: str) -> bool:
@@ -104,6 +123,18 @@ def _looks_like_natural_start(raw: str) -> bool:
     # Natural-language support is deliberately mention-oriented so ordinary chat
     # about the issue runner does not get consumed as a command.
     return bool(re.search(r"<@!?\d+>|@\w+", raw))
+
+
+def detect_start_intent(text: str) -> StartIntent | None:
+    """Detect whether text is an issue-runner start request without parsing refs."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    if _is_slash_start(raw):
+        return StartIntent(mode="slash")
+    if _looks_like_natural_start(raw):
+        return StartIntent(mode="mention")
+    return None
 
 
 def parse_start_command(text: str) -> StartCommand | None:
@@ -117,10 +148,11 @@ def parse_start_command(text: str) -> StartCommand | None:
     if not raw:
         return None
 
-    if _is_slash_start(raw):
+    intent = detect_start_intent(raw)
+    if intent and intent.mode == "slash":
         return StartCommand(reference=parse_issue_reference(raw), mode="slash")
 
-    if _looks_like_natural_start(raw):
+    if intent and intent.mode == "mention":
         return StartCommand(reference=parse_issue_reference(raw), mode="mention")
 
     return None
@@ -224,13 +256,9 @@ class StartCommandHandler:
         if _platform_value(event) != "discord":
             return None
 
-        try:
-            command = parse_start_command(getattr(event, "text", ""))
-        except IssueReferenceError as exc:
-            await _maybe_await(self.reply_sender(event, gateway, f"Invalid parent issue reference: {exc}"))
-            return {"action": "skip", "reason": "invalid parent issue reference"}
-
-        if command is None:
+        text = getattr(event, "text", "")
+        intent = detect_start_intent(text)
+        if intent is None:
             return None
 
         authorized = await _maybe_await(self.authorization_checker(event, gateway))
@@ -244,7 +272,26 @@ class StartCommandHandler:
             )
             return {"action": "skip", "reason": "unauthorized"}
 
-        issue_payload = await _maybe_await(self._get_issue(command.reference))
+        try:
+            command = parse_start_command(text)
+        except IssueReferenceError as exc:
+            await _maybe_await(self.reply_sender(event, gateway, f"Invalid parent issue reference: {exc}"))
+            return {"action": "skip", "reason": "invalid parent issue reference"}
+
+        if command is None:
+            return None
+
+        try:
+            issue_payload = await _maybe_await(self._get_issue(command.reference))
+        except Exception as exc:
+            await _maybe_await(
+                self.reply_sender(
+                    event,
+                    gateway,
+                    f"Unable to resolve GitHub issue {command.reference.repository}#{command.reference.number}: {exc}",
+                )
+            )
+            return {"action": "skip", "reason": "github issue lookup failed"}
         parent = _coerce_parent_issue(command.reference, issue_payload)
         await _maybe_await(
             self.reply_sender(

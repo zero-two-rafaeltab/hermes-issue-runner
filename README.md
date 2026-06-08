@@ -41,7 +41,10 @@ It also recognizes mention-oriented natural language, for example:
 
 The handler reuses Hermes Discord authorization through the injected gateway
 authorization predicate (for example `_is_user_authorized`) and requires an
-injected GitHub client with `get_issue(owner, repo, number)` for live use.
+injected GitHub client with `get_issue(owner, repo, number)` for live use. The
+plugin imports the handler as `issue_runner.start`; for direct local imports from
+a checkout, put `src/` on `PYTHONPATH` (the plugin does this for its repository
+layout during registration/tests).
 
 ## Local smoke checks
 
