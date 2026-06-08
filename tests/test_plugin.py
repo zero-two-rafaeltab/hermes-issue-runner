@@ -61,10 +61,10 @@ class FakeGitHub:
 
 
 class IssueRunnerPluginTests(unittest.TestCase):
-    def _event(self, text: str) -> SimpleNamespace:
+    def _event(self, text: str, user_id: str = "u1") -> SimpleNamespace:
         return SimpleNamespace(
             text=text,
-            source=SimpleNamespace(platform=SimpleNamespace(value="discord"), chat_id="c1", thread_id=None),
+            source=SimpleNamespace(platform=SimpleNamespace(value="discord"), chat_id="c1", thread_id=None, user_id=user_id),
         )
 
     def test_plugin_imports_public_issue_runner_package(self) -> None:
@@ -186,6 +186,96 @@ class IssueRunnerPluginTests(unittest.TestCase):
 
         self.assertIs(handler.github_client, github)
         self.assertIs(handler.git_client, git_client)
+
+    def test_build_handler_uses_issue_runner_recovery_waiter_first(self) -> None:
+        github = FakeGitHub()
+        preferred = SimpleNamespace(name="preferred")
+        fallback = SimpleNamespace(name="fallback")
+        handler = plugin._build_handler(
+            SimpleNamespace(
+                github_client=github,
+                issue_runner_recovery_response_waiter=preferred,
+                recovery_response_waiter=fallback,
+            )
+        )
+
+        self.assertIs(handler.recovery_response_waiter, preferred)
+
+    def test_build_handler_uses_recovery_waiter_fallback(self) -> None:
+        github = FakeGitHub()
+        waiter = SimpleNamespace(name="fallback")
+        handler = plugin._build_handler(SimpleNamespace(github_client=github, recovery_response_waiter=waiter))
+
+        self.assertIs(handler.recovery_response_waiter, waiter)
+
+    def test_plugin_recovery_waiter_retries_gateway_start_failure(self) -> None:
+        github = FakeGitHub()
+        hooks: list[tuple[str, object]] = []
+        replies: list[str] = []
+        attempts = 0
+
+        async def send(chat_id, content, metadata=None):
+            replies.append(content)
+
+        async def recovery_response_waiter(**kwargs):
+            return self._event("retry", user_id="u1")
+
+        ctx = SimpleNamespace(
+            github_client=github,
+            authorization_checker=lambda event, gateway: event.source.user_id == "u1",
+            issue_runner_recovery_response_waiter=recovery_response_waiter,
+            register_hook=lambda name, hook: hooks.append((name, hook)),
+        )
+
+        async def start_child_session(request):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("gateway start failed once")
+            return {"scheduled": True, "request": request}
+
+        gateway = SimpleNamespace(adapters={"discord": SimpleNamespace(send=send)}, start_child_session=start_child_session)
+        plugin.register(ctx)
+
+        result = asyncio.run(plugin.pre_gateway_dispatch(self._event("/issue-runner start nous/hermes-issue-runner#3"), gateway))
+
+        self.assertEqual(result, {"action": "skip", "reason": "issue-runner child run started", "child": "4"})
+        self.assertEqual(hooks, [("pre_gateway_dispatch", plugin.pre_gateway_dispatch)])
+        self.assertEqual(attempts, 2)
+        self.assertIn("gateway start failed once", replies[0])
+        self.assertIn("started gateway child session", replies[1])
+
+    def test_plugin_recovery_waiter_consumes_strict_stop(self) -> None:
+        github = FakeGitHub()
+        replies: list[str] = []
+        response_events = iter([self._event("retry please"), self._event("STOP"), self._event("stop")])
+
+        async def send(chat_id, content, metadata=None):
+            replies.append(content)
+
+        async def recovery_response_waiter(**kwargs):
+            return next(response_events)
+
+        ctx = SimpleNamespace(
+            github_client=github,
+            authorization_checker=lambda event, gateway: event.source.user_id == "u1",
+            recovery_response_waiter=recovery_response_waiter,
+            register_hook=lambda name, hook: None,
+        )
+
+        async def start_child_session(request):
+            raise RuntimeError("gateway start failed")
+
+        gateway = SimpleNamespace(adapters={"discord": SimpleNamespace(send=send)}, start_child_session=start_child_session)
+        plugin.register(ctx)
+
+        result = asyncio.run(plugin.pre_gateway_dispatch(self._event("/issue-runner start nous/hermes-issue-runner#3"), gateway))
+
+        self.assertEqual(result, {"action": "skip", "reason": "failure recovery: stop"})
+        self.assertEqual(github.add_label_calls, [("nous", "hermes-issue-runner", 4, "agent:in-progress")])
+        self.assertEqual(github.remove_label_calls, [])
+        self.assertEqual(len(replies), 1)
+        self.assertIn("exactly one word", replies[0])
 
     def test_unconfigured_github_client_returns_actionable_error(self) -> None:
         replies: list[str] = []

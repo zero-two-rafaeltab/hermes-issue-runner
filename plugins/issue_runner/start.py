@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 from .branch_prep import plan_branch_preparation
 from .child_run import prepare_child_run, start_child_issue_session
-from .failure import FailureRecoveryRequest, format_failure_prompt, wait_for_recovery_decision
+from .failure import FailureRecoveryRequest, wait_for_recovery_decision
 from .selection import IssueKey, select_next_child
 from .state import check_duplicate_run, ensure_operational_labels, mark_child_done, mark_child_started
 
@@ -131,6 +131,34 @@ def _child_run_completed(child_run: Any) -> bool:
     return False
 
 
+def _child_run_failed(child_run: Any) -> bool:
+    """Return whether a child session result explicitly reports failure."""
+
+    failure_statuses = {
+        "failed",
+        "failure",
+        "error",
+        "errored",
+        "cancelled",
+        "canceled",
+        "request_changes",
+        "request-changes",
+        "requested_changes",
+        "request_changes_failed",
+    }
+    for candidate in (child_run, _value_from_result(child_run, "result")):
+        if candidate is None:
+            continue
+        for name in ("failed", "error"):
+            value = _value_from_result(candidate, name)
+            if value is not None and bool(value):
+                return True
+        status = _value_from_result(candidate, "status")
+        if status is not None and str(status).strip().casefold() in failure_statuses:
+            return True
+    return False
+
+
 class ChildStartupError(RuntimeError):
     """Raised when branch prep or child session startup fails after selection."""
 
@@ -139,6 +167,10 @@ class ChildStartupError(RuntimeError):
         self.reason = reason
         self.child = child
         self.parent = parent
+
+
+class FailureRecoveryStopped(ChildStartupError):
+    """Raised when an authorized operator chooses to stop after a failure."""
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -442,14 +474,11 @@ class StartCommandHandler:
                 if duplicate_guard.has_incomplete_state:
                     await _maybe_await(self.reply_sender(event, gateway, duplicate_guard.message))
                     return {"action": "skip", "reason": "duplicate run in progress"}
-                run_result = await self._run_parent_loop(event=event, gateway=gateway, parent=parent)
+                run_result = await self._run_parent_loop_with_recovery(event=event, gateway=gateway, parent=parent)
+        except FailureRecoveryStopped:
+            return {"action": "skip", "reason": "failure recovery: stop"}
         except ChildStartupError as exc:
-            if self.recovery_response_waiter is not None:
-                decision = await self._pause_for_failure_recovery(event=event, gateway=gateway, failure=exc)
-                return {"action": "skip", "reason": f"failure recovery: {decision.command}"}
-            request = self._failure_recovery_request(parent_key, exc)
-            await _maybe_await(self.reply_sender(event, gateway, str(exc)))
-            await _maybe_await(self.reply_sender(event, gateway, format_failure_prompt(request)))
+            await self._report_unconfigured_failure_pause(event=event, gateway=gateway, failure=exc)
             return {"action": "skip", "reason": "failure pause pending"}
         except Exception as exc:
             await _maybe_await(self.reply_sender(event, gateway, f"Unable to advance parent issue {parent_key.ref}: {exc}"))
@@ -487,6 +516,45 @@ class StartCommandHandler:
             response_waiter=self.recovery_response_waiter,
             authorization_checker=self.authorization_checker,
         )
+
+    async def _report_unconfigured_failure_pause(self, *, event: Any, gateway: Any, failure: ChildStartupError) -> None:
+        parent = failure.parent or IssueKey("unknown", "unknown", 0)
+        request = self._failure_recovery_request(parent, failure)
+        message = (
+            "Hermes Issue Runner paused after a child attempt failure.\n"
+            f"Parent: {request.parent_issue}\n"
+            f"Child: {request.child_issue}\n"
+            f"Attempt: {request.attempt}\n"
+            f"Failure: {request.failure_summary}\n"
+            "Recovery waiter is unavailable, so this process cannot consume `retry` or `stop` replies here. "
+            "The in-progress label is preserved; an operator must rerun manually or configure the recovery_response_waiter seam."
+        )
+        await _maybe_await(self.reply_sender(event, gateway, message))
+
+    async def _run_parent_loop_with_recovery(self, *, event: Any, gateway: Any, parent: ParentIssue) -> ParentRunResult:
+        retry_count = 0
+        while True:
+            try:
+                return await self._run_parent_loop(event=event, gateway=gateway, parent=parent)
+            except ChildStartupError as exc:
+                if self.recovery_response_waiter is None:
+                    raise
+                decision = await self._pause_for_failure_recovery(event=event, gateway=gateway, failure=exc)
+                if decision.should_stop:
+                    raise FailureRecoveryStopped(
+                        exc.reason,
+                        f"{exc} (stopped by operator)",
+                        child=exc.child,
+                        parent=exc.parent,
+                    ) from exc
+                retry_count += 1
+                if retry_count > 10:
+                    raise ChildStartupError(
+                        exc.reason,
+                        f"{exc} (retry limit exceeded)",
+                        child=exc.child,
+                        parent=exc.parent,
+                    ) from exc
 
     async def _select_next_child(self, parent: ParentIssue) -> Any:
         return await select_next_child(IssueKey(parent.owner, parent.repo, parent.number), self.github_client)
@@ -531,6 +599,16 @@ class StartCommandHandler:
                 child=child,
                 parent=parent_key,
             ) from exc
+        if _child_run_failed(child_run):
+            status = _value_from_result(child_run, "status")
+            nested_status = _value_from_result(_value_from_result(child_run, "result"), "status")
+            detail = status if status is not None else nested_status
+            raise ChildStartupError(
+                "child session startup failed",
+                f"Child session for child #{child.number} reported failure status; paused with in-progress label preserved: {detail}",
+                child=child,
+                parent=parent_key,
+            )
         return child_run
 
     async def resume_parent(self, *, event: Any, gateway: Any, parent: IssueKey | IssueReference) -> ParentRunResult:
@@ -549,7 +627,7 @@ class StartCommandHandler:
         duplicate_guard = await check_duplicate_run(parent_key, self.github_client)
         if duplicate_guard.has_incomplete_state:
             raise ChildStartupError("duplicate run in progress", duplicate_guard.message)
-        return await self._run_parent_loop(event=event, gateway=gateway, parent=parent_issue)
+        return await self._run_parent_loop_with_recovery(event=event, gateway=gateway, parent=parent_issue)
 
     async def _run_parent_loop(self, *, event: Any, gateway: Any, parent: ParentIssue) -> ParentRunResult:
         """Advance a parent run while child sessions report completion.

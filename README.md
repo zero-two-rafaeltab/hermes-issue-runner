@@ -62,8 +62,10 @@ Operational labels:
 
 - `ready-for-agent` — child issue is eligible for selection.
 - `agent:in-progress` — child issue is reserved/running; duplicate parent starts
-  are refused while any child has this label. The handler cleans this label up on
-  branch preparation or child-session startup failure.
+  are refused while any child has this label. The handler preserves this label on
+  branch preparation, child-session startup, or review/child-session failure so
+  operators can inspect and recover the attempt. It is cleared only when the
+  child is marked `agent:done` or by explicit operator cleanup.
 - `agent:done` — child issue is complete; blockers referencing it are satisfied.
 
 The handler reuses Hermes Discord authorization through the injected gateway
