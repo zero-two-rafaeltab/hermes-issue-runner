@@ -180,6 +180,63 @@ class StartCommandTests(unittest.TestCase):
         self.assertEqual(result, {"action": "skip", "reason": "unauthorized"})
         self.assertEqual(github.calls, [("nous", "hermes-issue-runner", 1)])
 
+    def test_default_authorization_awaits_async_gateway_denial_before_bool_coercion(self) -> None:
+        github = FakeGitHub()
+        replies: list[str] = []
+
+        def reply_sender(event, gateway, message: str) -> bool:
+            replies.append(message)
+            return True
+
+        async def is_user_authorized(source) -> bool:
+            return False
+
+        gateway = SimpleNamespace(_is_user_authorized=is_user_authorized)
+        handler = StartCommandHandler(github, reply_sender=reply_sender)
+        result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#1"), gateway))
+        self.assertEqual(result, {"action": "skip", "reason": "unauthorized"})
+        self.assertEqual(github.calls, [])
+        self.assertIn("not authorized", replies[0])
+
+    def test_default_authorization_accepts_async_gateway_allow(self) -> None:
+        github = FakeGitHub()
+        replies: list[str] = []
+
+        def reply_sender(event, gateway, message: str) -> bool:
+            replies.append(message)
+            return True
+
+        async def is_user_authorized(source) -> bool:
+            return True
+
+        gateway = SimpleNamespace(is_user_authorized=is_user_authorized)
+        handler = StartCommandHandler(github, reply_sender=reply_sender)
+        result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#1"), gateway))
+        self.assertEqual(result, {"action": "skip", "reason": "issue-runner start resolved"})
+        self.assertEqual(github.calls, [("nous", "hermes-issue-runner", 1)])
+        self.assertIn("Title: PRD: Hermes Issue Runner MVP", replies[0])
+
+    def test_malformed_github_issue_payload_replies_actionably(self) -> None:
+        class MalformedGitHub(FakeGitHub):
+            def get_issue(self, owner: str, repo: str, number: int) -> dict[str, object]:
+                self.calls.append((owner, repo, number))
+                return {"owner": owner, "repo": repo, "number": number}
+
+        github = MalformedGitHub()
+        replies: list[str] = []
+
+        def reply_sender(event, gateway, message: str) -> bool:
+            replies.append(message)
+            return True
+
+        handler = StartCommandHandler(github, authorization_checker=lambda event, gateway: True, reply_sender=reply_sender)
+        result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#1"), SimpleNamespace()))
+        self.assertEqual(result, {"action": "skip", "reason": "github issue lookup failed"})
+        self.assertEqual(github.calls, [("nous", "hermes-issue-runner", 1)])
+        self.assertEqual(len(replies), 1)
+        self.assertIn("Unable to resolve GitHub issue nous/hermes-issue-runner#1", replies[0])
+        self.assertIn("did not include a title", replies[0])
+
 
 if __name__ == "__main__":
     unittest.main()
