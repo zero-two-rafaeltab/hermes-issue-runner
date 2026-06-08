@@ -61,6 +61,23 @@ Mentions #99 here do not count.
             (IssueKey("nous", "runner", 3), IssueKey("other", "project", 7)),
         )
 
+    def test_parse_blockers_rejects_malformed_github_issue_url_paths(self) -> None:
+        body = """## Blocked by
+- https://github.com/other/project/issues/7/extra
+- https://github.com/other/project/issues/8abc
+- https://github.com/other/project/issues/9
+- https://github.com/other/project/issues/10?from=body
+- https://github.com/other/project/issues/11#note
+"""
+        self.assertEqual(
+            parse_blockers(body, "nous", "runner"),
+            (
+                IssueKey("other", "project", 9),
+                IssueKey("other", "project", 10),
+                IssueKey("other", "project", 11),
+            ),
+        )
+
     def test_selects_first_ready_unblocked_child_by_issue_number(self) -> None:
         github = FakeGitHub(
             [

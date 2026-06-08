@@ -22,7 +22,7 @@ DONE_LABEL = "agent:done"
 GITHUB_ISSUE_URL_RE = re.compile(
     r"https?://github\.com/"
     r"(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/issues/(?P<number>[1-9][0-9]*)"
-    r"(?:[#?][^\s)>]*)?",
+    r"(?:[#?][^\s)>]*)?(?=$|[\s)>\],.;:!])",
     re.IGNORECASE,
 )
 ISSUE_NUMBER_RE = re.compile(r"(?<![A-Za-z0-9_/.-])#(?P<number>[1-9][0-9]*)\b")

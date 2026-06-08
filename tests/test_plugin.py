@@ -67,6 +67,7 @@ class IssueRunnerPluginTests(unittest.TestCase):
             try:
                 standalone_plugin = importlib.import_module("issue_runner")
                 standalone_start = importlib.import_module("issue_runner.start")
+                standalone_selection = importlib.import_module("issue_runner.selection")
             finally:
                 for name in list(sys.modules):
                     if name == "issue_runner" or name.startswith("issue_runner."):
@@ -75,6 +76,7 @@ class IssueRunnerPluginTests(unittest.TestCase):
                 sys.path[:] = original_path
 
         self.assertIs(standalone_plugin.StartCommandHandler, standalone_start.StartCommandHandler)
+        self.assertTrue(callable(standalone_selection.select_next_child))
         self.assertTrue(callable(standalone_plugin.register))
 
     def test_register_uses_injected_github_and_auth_seams(self) -> None:

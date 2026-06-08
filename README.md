@@ -2,7 +2,7 @@
 
 A Hermes gateway plugin for running GitHub sub-issues through auditable agent implementation workflows from Discord.
 
-This repository currently contains the issue #2 technical spike artifact plus the first minimal issue-runner start command surface for Discord.
+This repository currently contains the issue #2 technical spike artifact, the first minimal issue-runner start command surface for Discord, and issue #4 child discovery/selection behavior for ready child issues and blockers.
 
 ## Spike #2 result
 
