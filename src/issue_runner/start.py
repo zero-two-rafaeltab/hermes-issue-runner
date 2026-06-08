@@ -67,6 +67,62 @@ class ParentIssue:
         return f"{self.owner}/{self.repo}"
 
 
+@dataclass(frozen=True)
+class ParentRunResult:
+    """Outcome of advancing a parent issue run through runnable children."""
+
+    parent: IssueKey
+    final_selection: Any
+    started_runs: tuple[Any, ...]
+    completed_children: tuple[IssueKey, ...]
+
+    @property
+    def first_started_run(self) -> Any | None:
+        return self.started_runs[0] if self.started_runs else None
+
+    @property
+    def pending_run(self) -> Any | None:
+        if not self.started_runs:
+            return None
+        last_run = self.started_runs[-1]
+        return None if _child_run_completed(last_run) else last_run
+
+
+def _truthy_status(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().casefold() in {"approved", "complete", "completed", "done", "agent:done", "success", "succeeded"}
+    return bool(value)
+
+
+def _value_from_result(result: Any, name: str) -> Any:
+    if isinstance(result, dict):
+        return result.get(name)
+    return getattr(result, name, None)
+
+
+def _child_run_completed(child_run: Any) -> bool:
+    """Return whether a child session result means the child reached agent:done.
+
+    The live gateway seam may only acknowledge scheduling, in which case the
+    parent loop stops after the fresh child session starts. Tests and future
+    adapters can return an explicit completion signal after a child session has
+    finished so the loop can re-read GitHub state and advance without relying on
+    one long agent context.
+    """
+
+    for candidate in (child_run, _value_from_result(child_run, "result")):
+        if candidate is None:
+            continue
+        for name in ("completed", "agent_done", "succeeded", "success"):
+            value = _value_from_result(candidate, name)
+            if value is not None:
+                return _truthy_status(value)
+        status = _value_from_result(candidate, "status")
+        if status is not None:
+            return _truthy_status(status)
+    return False
+
+
 async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
@@ -292,7 +348,6 @@ class StartCommandHandler:
         if command is None:
             return None
 
-        child_run = None
         try:
             issue_payload = await _maybe_await(self._get_issue(command.reference))
             parent = _coerce_parent_issue(command.reference, issue_payload)
@@ -302,31 +357,9 @@ class StartCommandHandler:
             if duplicate_guard.has_incomplete_state:
                 await _maybe_await(self.reply_sender(event, gateway, duplicate_guard.message))
                 return {"action": "skip", "reason": "duplicate run in progress"}
-            selection = await self._select_next_child(parent)
-            if selection.has_runnable_child:
-                assert selection.selected is not None
-                prepared_plan = prepare_child_run(parent=parent_key, child=selection.selected)
-                branch_preparation = await _maybe_await(
-                    self.branch_preparer(
-                        child=selection.selected,
-                        child_branch=prepared_plan.branch_name,
-                        github_client=self.github_client,
-                        git_client=self.git_client,
-                        pr_base="main",
-                    )
-                )
-                child_run = await _maybe_await(
-                    self.child_session_starter(
-                        gateway=gateway,
-                        event=event,
-                        parent=parent_key,
-                        child=selection.selected,
-                        base_branch=branch_preparation.base_branch,
-                        pr_base=branch_preparation.pr_base,
-                        branch_preparation=branch_preparation,
-                    )
-                )
-                await _maybe_await(mark_child_started(selection.selected, self.github_client))
+            run_result = await self._run_parent_loop(event=event, gateway=gateway, parent=parent)
+            selection = run_result.final_selection
+            child_run = run_result.pending_run or run_result.first_started_run
         except Exception as exc:
             await _maybe_await(
                 self.reply_sender(
@@ -336,6 +369,9 @@ class StartCommandHandler:
                 )
             )
             return {"action": "skip", "reason": "github issue lookup failed"}
+        completed_summary = ""
+        if run_result.completed_children:
+            completed_summary = "\nCompleted child runs: " + ", ".join(f"#{child.number}" for child in run_result.completed_children) + "."
         await _maybe_await(
             self.reply_sender(
                 event,
@@ -346,16 +382,17 @@ class StartCommandHandler:
                     f"Parent issue: #{parent.number}\n"
                     f"Title: {parent.title}\n"
                     f"Child selection: {selection.message}"
+                    + completed_summary
                     + (
                         "\nChild run: started gateway child session "
                         f"for #{selection.selected.number} on branch {child_run.plan.branch_name}."
-                        if selection.has_runnable_child and child_run is not None
+                        if selection.has_runnable_child and child_run is not None and run_result.pending_run is not None
                         else ""
                     )
                 ),
             )
         )
-        if selection.has_runnable_child:
+        if run_result.pending_run is not None:
             assert selection.selected is not None
             return {
                 "action": "skip",
@@ -374,6 +411,63 @@ class StartCommandHandler:
 
     async def _select_next_child(self, parent: ParentIssue) -> Any:
         return await select_next_child(IssueKey(parent.owner, parent.repo, parent.number), self.github_client)
+
+    async def _start_selected_child(self, *, event: Any, gateway: Any, parent_key: IssueKey, child: Any) -> Any:
+        prepared_plan = prepare_child_run(parent=parent_key, child=child)
+        branch_preparation = await _maybe_await(
+            self.branch_preparer(
+                child=child,
+                child_branch=prepared_plan.branch_name,
+                github_client=self.github_client,
+                git_client=self.git_client,
+                pr_base="main",
+            )
+        )
+        child_run = await _maybe_await(
+            self.child_session_starter(
+                gateway=gateway,
+                event=event,
+                parent=parent_key,
+                child=child,
+                base_branch=branch_preparation.base_branch,
+                pr_base=branch_preparation.pr_base,
+                branch_preparation=branch_preparation,
+            )
+        )
+        await _maybe_await(mark_child_started(child, self.github_client))
+        return child_run
+
+    async def _run_parent_loop(self, *, event: Any, gateway: Any, parent: ParentIssue) -> ParentRunResult:
+        """Advance a parent run while child sessions report completion.
+
+        Each iteration re-selects from GitHub rather than retaining a precomputed
+        child list. A normal gateway scheduling acknowledgement starts exactly one
+        fresh child session and leaves the loop pending; an explicit completion
+        signal allows controlled/test adapters to continue to the next unblocked
+        ready child.
+        """
+
+        parent_key = IssueKey(parent.owner, parent.repo, parent.number)
+        started_runs: list[Any] = []
+        completed_children: list[IssueKey] = []
+        max_iterations = 100
+        for _ in range(max_iterations):
+            selection = await self._select_next_child(parent)
+            if not selection.has_runnable_child:
+                return ParentRunResult(parent_key, selection, tuple(started_runs), tuple(completed_children))
+            assert selection.selected is not None
+            child_run = await self._start_selected_child(
+                event=event,
+                gateway=gateway,
+                parent_key=parent_key,
+                child=selection.selected,
+            )
+            started_runs.append(child_run)
+            if not _child_run_completed(child_run):
+                return ParentRunResult(parent_key, selection, tuple(started_runs), tuple(completed_children))
+            await _maybe_await(mark_child_done(selection.selected, self.github_client))
+            completed_children.append(selection.selected.key)
+        raise RuntimeError("Parent run loop exceeded 100 child iterations without reaching a stable state")
 
     async def complete_child(self, child: IssueKey) -> None:
         """Mark a successfully completed child done through the operational state model."""
