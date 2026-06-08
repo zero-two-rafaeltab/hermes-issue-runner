@@ -426,11 +426,12 @@ class StartCommandTests(unittest.TestCase):
         )
         result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#1"), SimpleNamespace()))
 
-        self.assertEqual(result, {"action": "skip", "reason": "branch preparation failed"})
+        self.assertEqual(result, {"action": "skip", "reason": "failure pause pending"})
         self.assertEqual(github.add_label_calls, [("nous", "hermes-issue-runner", 9, "agent:in-progress")])
-        self.assertEqual(github.remove_label_calls, [("nous", "hermes-issue-runner", 9, "agent:in-progress")])
-        self.assertIn("cleaned up in-progress label", replies[0])
+        self.assertEqual(github.remove_label_calls, [])
+        self.assertIn("in-progress label preserved", replies[0])
         self.assertIn("branch prep failed", replies[0])
+        self.assertIn("exactly one word", replies[1])
 
     def test_child_session_failure_cleans_up_reserved_child_label(self) -> None:
         github = FakeGitHub()
@@ -451,10 +452,48 @@ class StartCommandTests(unittest.TestCase):
         )
         result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#1"), SimpleNamespace()))
 
-        self.assertEqual(result, {"action": "skip", "reason": "child session startup failed"})
+        self.assertEqual(result, {"action": "skip", "reason": "failure pause pending"})
         self.assertEqual(github.add_label_calls, [("nous", "hermes-issue-runner", 9, "agent:in-progress")])
-        self.assertEqual(github.remove_label_calls, [("nous", "hermes-issue-runner", 9, "agent:in-progress")])
+        self.assertEqual(github.remove_label_calls, [])
         self.assertIn("session failed", replies[0])
+        self.assertIn("`retry` or `stop`", replies[1])
+
+    def test_failure_recovery_waits_for_strict_authorized_stop_without_mutating_state(self) -> None:
+        github = FakeGitHub()
+        replies: list[str] = []
+        response_events = iter(
+            [
+                self._event("retry", user_id="intruder"),
+                self._event("skip", user_id="u1"),
+                self._event("stop", user_id="u1"),
+            ]
+        )
+
+        async def reply_sender(event, gateway, message: str) -> bool:
+            replies.append(message)
+            return True
+
+        async def child_session_starter(**kwargs):
+            raise RuntimeError("review failed")
+
+        async def recovery_response_waiter(**kwargs):
+            return next(response_events)
+
+        handler = StartCommandHandler(
+            github,
+            authorization_checker=lambda event, gateway: event.source.user_id == "u1",
+            reply_sender=reply_sender,
+            child_session_starter=child_session_starter,
+            recovery_response_waiter=recovery_response_waiter,
+        )
+        result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#1"), SimpleNamespace()))
+
+        self.assertEqual(result, {"action": "skip", "reason": "failure recovery: stop"})
+        self.assertEqual(github.add_label_calls, [("nous", "hermes-issue-runner", 9, "agent:in-progress")])
+        self.assertEqual(github.remove_label_calls, [])
+        self.assertEqual(len(replies), 1)
+        self.assertIn("review failed", replies[0])
+        self.assertIn("exactly one word", replies[0])
 
     def test_authorized_natural_mention_resolves_same_behavior(self) -> None:
         handler, github, replies = self._handler(allowed=True)
