@@ -67,7 +67,16 @@ def _branch_setup_text(
     pr_base: str,
     branch_preparation: BranchPreparationPlan | None,
 ) -> str:
-    if branch_preparation and branch_preparation.has_dependencies:
+    if branch_preparation:
+        command_lines = "\n".join(f"  - `{' '.join(command)}`" for command in branch_preparation.git_commands)
+        if not branch_preparation.has_dependencies:
+            return f"""Dependency-aware branch preparation:
+- This child has no unsatisfied dependency branches in its `## Blocked by` section.
+- Start from latest `{branch_preparation.base_branch}` and keep the pull request base as `{branch_preparation.pr_base}`.
+- Required git command plan:
+{command_lines}
+- Create `{branch_preparation.child_branch}` from the prepared `{branch_preparation.base_branch}` before implementation."""
+
         dependency_lines = "\n".join(
             f"- {dependency.issue.ref}: `{dependency.branch}` covers "
             f"{', '.join(key.ref for key in dependency.covers) or dependency.issue.ref}"
@@ -80,7 +89,6 @@ def _branch_setup_text(
             )
             or "- none; chosen base already contains all known direct dependencies"
         )
-        command_lines = "\n".join(f"  - `{' '.join(command)}`" for command in branch_preparation.git_commands)
         return f"""Dependency-aware branch preparation:
 - Dependency base branch: `{branch_preparation.base_branch}`
 - Pull request base remains: `{branch_preparation.pr_base}`

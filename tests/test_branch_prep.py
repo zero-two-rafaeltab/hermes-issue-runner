@@ -134,6 +134,25 @@ class BranchPreparationTests(unittest.TestCase):
         self.assertIn("Mutate only the new child branch", prompt)
         self.assertIn("do not retarget, rebase, or otherwise mutate dependency PR branches", prompt)
 
+    def test_no_dependency_child_prompt_renders_branch_preparation_commands(self) -> None:
+        child = self._child(7, "## Acceptance criteria\n\n- [ ] Build it\n")
+        branch_plan = asyncio.run(
+            plan_branch_preparation(child=child, child_branch="feat/issue-7", github_client=FakeGitHub())
+        )
+        prompt = build_auditable_child_prompt(
+            parent=IssueKey("nous", "runner", 1),
+            child=child,
+            branch_name=branch_plan.child_branch,
+            base_branch=branch_plan.base_branch,
+            pr_base=branch_plan.pr_base,
+            branch_preparation=branch_plan,
+        )
+
+        self.assertIn("git fetch origin", prompt)
+        self.assertIn("git checkout -B feat/issue-7 origin/main", prompt)
+        self.assertNotIn("git checkout main", prompt)
+        self.assertNotIn("git pull --ff-only origin main", prompt)
+
     def test_execute_branch_preparation_turns_rebase_failure_into_pause_failure(self) -> None:
         child = self._child(10, "## Blocked by\n\n- #6\n- #9\n")
         github = FakeGitHub()
