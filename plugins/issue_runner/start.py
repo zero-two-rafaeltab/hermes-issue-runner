@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import urlparse
 
+from .child_run import start_child_issue_session
 from .selection import IssueKey, select_next_child
 from .state import check_duplicate_run, ensure_operational_labels, mark_child_done, mark_child_started
 
@@ -250,10 +251,12 @@ class StartCommandHandler:
         github_client: Any,
         authorization_checker: Callable[[Any, Any], Any] | None = None,
         reply_sender: Callable[[Any, Any, str], Any] | None = None,
+        child_session_starter: Callable[..., Any] | None = None,
     ) -> None:
         self.github_client = github_client
         self.authorization_checker = authorization_checker or default_authorization_checker
         self.reply_sender = reply_sender or send_discord_reply
+        self.child_session_starter = child_session_starter or start_child_issue_session
 
     async def handle(self, event: Any, gateway: Any) -> dict[str, str] | None:
         if _platform_value(event) != "discord":
@@ -284,6 +287,7 @@ class StartCommandHandler:
         if command is None:
             return None
 
+        child_run = None
         try:
             issue_payload = await _maybe_await(self._get_issue(command.reference))
             parent = _coerce_parent_issue(command.reference, issue_payload)
@@ -297,6 +301,16 @@ class StartCommandHandler:
             if selection.has_runnable_child:
                 assert selection.selected is not None
                 await _maybe_await(mark_child_started(selection.selected, self.github_client))
+                child_run = await _maybe_await(
+                    self.child_session_starter(
+                        gateway=gateway,
+                        event=event,
+                        parent=parent_key,
+                        child=selection.selected,
+                        base_branch="main",
+                        pr_base="main",
+                    )
+                )
         except Exception as exc:
             await _maybe_await(
                 self.reply_sender(
@@ -316,6 +330,12 @@ class StartCommandHandler:
                     f"Parent issue: #{parent.number}\n"
                     f"Title: {parent.title}\n"
                     f"Child selection: {selection.message}"
+                    + (
+                        "\nChild run: started gateway child session "
+                        f"for #{selection.selected.number} on branch {child_run.plan.branch_name}."
+                        if selection.has_runnable_child and child_run is not None
+                        else ""
+                    )
                 ),
             )
         )
@@ -323,7 +343,7 @@ class StartCommandHandler:
             assert selection.selected is not None
             return {
                 "action": "skip",
-                "reason": "issue-runner child selected",
+                "reason": "issue-runner child run started",
                 "child": str(selection.selected.number),
             }
         return {"action": "skip", "reason": selection.status}
