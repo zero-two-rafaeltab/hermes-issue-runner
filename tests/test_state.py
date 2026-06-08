@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 import sys
 import unittest
@@ -55,7 +56,7 @@ def child(number: int, *, labels=None, title=None):
 class OperationalStateTests(unittest.TestCase):
     def test_ensure_operational_labels_uses_only_in_progress_and_done(self) -> None:
         github = FakeGitHub()
-        ensure_operational_labels("nous", "runner", github)
+        asyncio.run(ensure_operational_labels("nous", "runner", github))
         self.assertEqual(OPERATIONAL_LABELS, ("agent:in-progress", "agent:done"))
         self.assertEqual(github.ensure_calls, [("nous", "runner", "agent:in-progress"), ("nous", "runner", "agent:done")])
         self.assertNotIn("agent:blocked", [label for *_repo, label in github.ensure_calls])
@@ -67,7 +68,7 @@ class OperationalStateTests(unittest.TestCase):
                 child(2, labels=["agent:in-progress"], title="Earlier active child"),
             ]
         )
-        guard = check_duplicate_run(IssueKey("nous", "runner", 1), github)
+        guard = asyncio.run(check_duplicate_run(IssueKey("nous", "runner", 1), github))
         self.assertTrue(guard.has_incomplete_state)
         self.assertEqual([issue.number for issue in guard.in_progress], [2])
         self.assertIn("Refusing duplicate start", guard.message)
@@ -75,21 +76,52 @@ class OperationalStateTests(unittest.TestCase):
 
     def test_duplicate_guard_allows_start_when_no_child_in_progress(self) -> None:
         github = FakeGitHub([child(2, labels=["ready-for-agent"]), child(3, labels=["agent:done"])])
-        guard = check_duplicate_run(IssueKey("nous", "runner", 1), github)
+        guard = asyncio.run(check_duplicate_run(IssueKey("nous", "runner", 1), github))
         self.assertFalse(guard.has_incomplete_state)
         self.assertIn(f"no {IN_PROGRESS_LABEL} children", guard.message)
 
+    def test_duplicate_guard_awaits_async_child_listing(self) -> None:
+        class AsyncGitHub(FakeGitHub):
+            async def list_child_issues(self, owner: str, repo: str, parent_number: int):  # type: ignore[override]
+                self.child_calls.append((owner, repo, parent_number))
+                return self.children
+
+        github = AsyncGitHub([child(4, labels=["agent:in-progress"], title="Async active child")])
+        guard = asyncio.run(check_duplicate_run(IssueKey("nous", "runner", 1), github))
+        self.assertTrue(guard.has_incomplete_state)
+        self.assertEqual([issue.number for issue in guard.in_progress], [4])
+        self.assertEqual(github.child_calls, [("nous", "runner", 1)])
+
     def test_mark_child_started_adds_in_progress_without_touching_ready_label(self) -> None:
         github = FakeGitHub()
-        mark_child_started(IssueKey("nous", "runner", 5), github)
+        asyncio.run(mark_child_started(IssueKey("nous", "runner", 5), github))
         self.assertEqual(github.add_calls, [("nous", "runner", 5, "agent:in-progress")])
         self.assertEqual(github.remove_calls, [])
 
     def test_mark_child_done_removes_in_progress_and_adds_done(self) -> None:
         github = FakeGitHub()
-        mark_child_done(IssueKey("nous", "runner", 5), github)
+        asyncio.run(mark_child_done(IssueKey("nous", "runner", 5), github))
         self.assertEqual(github.remove_calls, [("nous", "runner", 5, "agent:in-progress")])
         self.assertEqual(github.add_calls, [("nous", "runner", 5, "agent:done")])
+
+    def test_async_label_adapter_methods_are_awaited(self) -> None:
+        class AsyncGitHub(FakeGitHub):
+            async def ensure_label(self, owner: str, repo: str, label: str) -> None:  # type: ignore[override]
+                self.ensure_calls.append((owner, repo, label))
+
+            async def add_issue_label(self, owner: str, repo: str, number: int, label: str) -> None:  # type: ignore[override]
+                self.add_calls.append((owner, repo, number, label))
+
+            async def remove_issue_label(self, owner: str, repo: str, number: int, label: str) -> None:  # type: ignore[override]
+                self.remove_calls.append((owner, repo, number, label))
+
+        github = AsyncGitHub()
+        asyncio.run(ensure_operational_labels("nous", "runner", github))
+        asyncio.run(mark_child_started(IssueKey("nous", "runner", 5), github))
+        asyncio.run(mark_child_done(IssueKey("nous", "runner", 5), github))
+        self.assertEqual(github.ensure_calls, [("nous", "runner", "agent:in-progress"), ("nous", "runner", "agent:done")])
+        self.assertEqual(github.add_calls, [("nous", "runner", 5, "agent:in-progress"), ("nous", "runner", 5, "agent:done")])
+        self.assertEqual(github.remove_calls, [("nous", "runner", 5, "agent:in-progress")])
 
 
 if __name__ == "__main__":

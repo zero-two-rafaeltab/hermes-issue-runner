@@ -12,12 +12,19 @@ and should expose ``get_issue(owner, repo, number)`` for blocker lookups.
 
 from __future__ import annotations
 
+import inspect
 import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable, cast
 
 READY_LABEL = "ready-for-agent"
 DONE_LABEL = "agent:done"
+
+
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 GITHUB_ISSUE_URL_RE = re.compile(
     r"https?://github\.com/"
@@ -212,23 +219,23 @@ def blocker_satisfied(issue: GitHubIssue) -> bool:
     return issue.is_done
 
 
-def _list_child_payloads(github_client: Any, parent: IssueKey) -> Iterable[Any]:
+async def _list_child_payloads(github_client: Any, parent: IssueKey) -> Iterable[Any]:
     for name in ("list_child_issues", "list_sub_issues", "get_child_issues"):
         method = getattr(github_client, name, None)
         if callable(method):
-            return cast(Iterable[Any], method(parent.owner, parent.repo, parent.number))
+            return cast(Iterable[Any], await _maybe_await(method(parent.owner, parent.repo, parent.number)))
     raise TypeError(
         "github_client must expose list_child_issues(owner, repo, parent_number) "
         "or list_sub_issues/get_child_issues for child discovery"
     )
 
 
-def _get_issue(github_client: Any, key: IssueKey) -> Any:
+async def _get_issue(github_client: Any, key: IssueKey) -> Any:
     getter = getattr(github_client, "get_issue", None)
     if callable(getter):
-        return getter(key.owner, key.repo, key.number)
+        return await _maybe_await(getter(key.owner, key.repo, key.number))
     if callable(github_client):
-        return github_client(key.owner, key.repo, key.number)
+        return await _maybe_await(github_client(key.owner, key.repo, key.number))
     raise TypeError("github_client must expose get_issue(owner, repo, number) for blocker lookup")
 
 
@@ -242,11 +249,11 @@ def _format_keys(keys: Iterable[IssueKey]) -> str:
     return ", ".join(key.ref for key in keys)
 
 
-def select_next_child(parent: IssueKey, github_client: Any) -> ChildSelection:
+async def select_next_child(parent: IssueKey, github_client: Any) -> ChildSelection:
     """Choose the first runnable child deterministically by issue number."""
     children = tuple(
         sorted(
-            (coerce_github_issue(parent.owner, parent.repo, payload) for payload in _list_child_payloads(github_client, parent)),
+            (coerce_github_issue(parent.owner, parent.repo, payload) for payload in await _list_child_payloads(github_client, parent)),
             key=lambda issue: issue.number,
         )
     )
@@ -260,7 +267,7 @@ def select_next_child(parent: IssueKey, github_client: Any) -> ChildSelection:
         blockers = parse_blockers(child.body, child.owner, child.repo)
         unsatisfied: list[IssueKey] = []
         for blocker in blockers:
-            blocker_issue = coerce_github_issue(blocker.owner, blocker.repo, _get_issue(github_client, blocker))
+            blocker_issue = coerce_github_issue(blocker.owner, blocker.repo, await _get_issue(github_client, blocker))
             if not blocker_satisfied(blocker_issue):
                 unsatisfied.append(blocker)
         child_blockers = ChildBlockers(child=child, blockers=blockers, unsatisfied=tuple(unsatisfied))

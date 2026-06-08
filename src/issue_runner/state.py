@@ -11,6 +11,7 @@ runner does not create or depend on ``agent:blocked``.
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from typing import Any, Iterable, cast
 
@@ -39,11 +40,11 @@ class DuplicateRunGuard:
         return f"Refusing duplicate start; {IN_PROGRESS_LABEL} already present on: {children}."
 
 
-def _list_child_payloads(github_client: Any, parent: IssueKey) -> Iterable[Any]:
+async def _list_child_payloads(github_client: Any, parent: IssueKey) -> Iterable[Any]:
     for name in ("list_child_issues", "list_sub_issues", "get_child_issues"):
         method = getattr(github_client, name, None)
         if callable(method):
-            return cast(Iterable[Any], method(parent.owner, parent.repo, parent.number))
+            return cast(Iterable[Any], await _maybe_await(method(parent.owner, parent.repo, parent.number)))
     raise TypeError(
         "github_client must expose list_child_issues(owner, repo, parent_number) "
         "or list_sub_issues/get_child_issues for duplicate-run checks"
@@ -54,20 +55,20 @@ def _issue_has_label(issue: GitHubIssue, label: str) -> bool:
     return issue.has_label(label)
 
 
-def in_progress_children(parent: IssueKey, github_client: Any) -> tuple[GitHubIssue, ...]:
+async def in_progress_children(parent: IssueKey, github_client: Any) -> tuple[GitHubIssue, ...]:
     """Return child issues under ``parent`` currently labeled in progress."""
 
     children = (
         coerce_github_issue(parent.owner, parent.repo, payload)
-        for payload in _list_child_payloads(github_client, parent)
+        for payload in await _list_child_payloads(github_client, parent)
     )
     return tuple(sorted((child for child in children if _issue_has_label(child, IN_PROGRESS_LABEL)), key=lambda child: child.number))
 
 
-def check_duplicate_run(parent: IssueKey, github_client: Any) -> DuplicateRunGuard:
+async def check_duplicate_run(parent: IssueKey, github_client: Any) -> DuplicateRunGuard:
     """Refuse a new start when any child already has incomplete runner state."""
 
-    return DuplicateRunGuard(parent=parent, in_progress=in_progress_children(parent, github_client))
+    return DuplicateRunGuard(parent=parent, in_progress=await in_progress_children(parent, github_client))
 
 
 def _call_first(github_client: Any, names: tuple[str, ...], *args: Any) -> Any:
@@ -78,18 +79,24 @@ def _call_first(github_client: Any, names: tuple[str, ...], *args: Any) -> Any:
     raise TypeError(f"github_client must expose one of: {', '.join(names)}")
 
 
-def ensure_operational_labels(owner: str, repo: str, github_client: Any) -> None:
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+async def ensure_operational_labels(owner: str, repo: str, github_client: Any) -> None:
     """Create or verify the two MVP automation labels when the adapter supports it."""
 
     ensure = getattr(github_client, "ensure_label", None)
     if callable(ensure):
         for label in OPERATIONAL_LABELS:
-            ensure(owner, repo, label)
+            await _maybe_await(ensure(owner, repo, label))
         return
 
     ensure_many = getattr(github_client, "ensure_labels", None)
     if callable(ensure_many):
-        ensure_many(owner, repo, OPERATIONAL_LABELS)
+        await _maybe_await(ensure_many(owner, repo, OPERATIONAL_LABELS))
         return
 
     # Read-only/test adapters may not manage labels. Selection still remains
@@ -123,16 +130,16 @@ def remove_issue_label(issue: IssueKey, label: str, github_client: Any) -> Any:
     )
 
 
-def mark_child_started(child: GitHubIssue | IssueKey, github_client: Any) -> None:
+async def mark_child_started(child: GitHubIssue | IssueKey, github_client: Any) -> None:
     """Mark a selected child in progress immediately without touching triage labels."""
 
     key = child.key if isinstance(child, GitHubIssue) else child
-    add_issue_label(key, IN_PROGRESS_LABEL, github_client)
+    await _maybe_await(add_issue_label(key, IN_PROGRESS_LABEL, github_client))
 
 
-def mark_child_done(child: GitHubIssue | IssueKey, github_client: Any) -> None:
+async def mark_child_done(child: GitHubIssue | IssueKey, github_client: Any) -> None:
     """Transition a successfully completed child from in-progress to done."""
 
     key = child.key if isinstance(child, GitHubIssue) else child
-    remove_issue_label(key, IN_PROGRESS_LABEL, github_client)
-    add_issue_label(key, DONE_LABEL, github_client)
+    await _maybe_await(remove_issue_label(key, IN_PROGRESS_LABEL, github_client))
+    await _maybe_await(add_issue_label(key, DONE_LABEL, github_client))

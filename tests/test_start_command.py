@@ -175,6 +175,37 @@ class StartCommandTests(unittest.TestCase):
         self.assertIn("Refusing duplicate start", replies[0])
         self.assertIn("#8 Active child", replies[0])
 
+    def test_async_start_handler_awaits_github_child_listing_and_selection(self) -> None:
+        class AsyncGitHub(FakeGitHub):
+            async def get_issue(self, owner: str, repo: str, number: int) -> dict[str, object]:  # type: ignore[override]
+                self.calls.append((owner, repo, number))
+                return {"owner": owner, "repo": repo, "number": number, "title": "Async Parent"}
+
+            async def list_child_issues(self, owner: str, repo: str, parent_number: int) -> list[dict[str, object]]:  # type: ignore[override]
+                self.child_calls.append((owner, repo, parent_number))
+                return self.children
+
+            async def ensure_label(self, owner: str, repo: str, label: str) -> None:  # type: ignore[override]
+                self.ensure_calls.append((owner, repo, label))
+
+            async def add_issue_label(self, owner: str, repo: str, number: int, label: str) -> None:  # type: ignore[override]
+                self.add_label_calls.append((owner, repo, number, label))
+
+        github = AsyncGitHub()
+        replies: list[str] = []
+
+        async def reply_sender(event, gateway, message: str) -> bool:
+            replies.append(message)
+            return True
+
+        handler = StartCommandHandler(github, authorization_checker=lambda event, gateway: True, reply_sender=reply_sender)
+        result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#1"), SimpleNamespace()))
+        self.assertEqual(result, {"action": "skip", "reason": "issue-runner child selected", "child": "9"})
+        self.assertEqual(github.calls, [("nous", "hermes-issue-runner", 1)])
+        self.assertEqual(github.child_calls, [("nous", "hermes-issue-runner", 1), ("nous", "hermes-issue-runner", 1)])
+        self.assertEqual(github.add_label_calls, [("nous", "hermes-issue-runner", 9, "agent:in-progress")])
+        self.assertIn("Title: Async Parent", replies[0])
+
     def test_unauthorized_user_is_rejected_without_github_work(self) -> None:
         handler, github, replies = self._handler(allowed=False)
         result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#1"), SimpleNamespace()))
