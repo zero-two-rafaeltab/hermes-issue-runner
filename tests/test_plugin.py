@@ -23,22 +23,41 @@ class FakeGitHub:
         self.child_calls: list[tuple[str, str, int]] = []
         self.ensure_calls: list[tuple[str, str, str]] = []
         self.add_label_calls: list[tuple[str, str, int, str]] = []
+        self.remove_label_calls: list[tuple[str, str, int, str]] = []
+        self.children: list[dict[str, object]] = [
+            {"owner": "nous", "repo": "hermes-issue-runner", "number": 4, "title": "Child", "labels": ["ready-for-agent"]}
+        ]
 
     def get_issue(self, owner: str, repo: str, number: int) -> dict[str, object]:
         self.calls.append((owner, repo, number))
+        for child in self.children:
+            if child.get("number") == number:
+                return child
         return {"owner": owner, "repo": repo, "number": number, "title": "Injected title"}
 
     def list_child_issues(self, owner: str, repo: str, parent_number: int) -> list[dict[str, object]]:
         self.child_calls.append((owner, repo, parent_number))
-        return [
-            {"owner": owner, "repo": repo, "number": 4, "title": "Child", "labels": ["ready-for-agent"]}
-        ]
+        return self.children
 
     def ensure_label(self, owner: str, repo: str, label: str) -> None:
         self.ensure_calls.append((owner, repo, label))
 
     def add_issue_label(self, owner: str, repo: str, number: int, label: str) -> None:
         self.add_label_calls.append((owner, repo, number, label))
+        for child in self.children:
+            if child.get("number") == number:
+                raw_labels = child.get("labels", [])
+                labels = list(raw_labels if isinstance(raw_labels, list) else [])
+                if label not in labels:
+                    labels.append(label)
+                child["labels"] = labels
+
+    def remove_issue_label(self, owner: str, repo: str, number: int, label: str) -> None:
+        self.remove_label_calls.append((owner, repo, number, label))
+        for child in self.children:
+            if child.get("number") == number:
+                raw_labels = child.get("labels", [])
+                child["labels"] = [existing for existing in (raw_labels if isinstance(raw_labels, list) else []) if existing != label]
 
 
 class IssueRunnerPluginTests(unittest.TestCase):
@@ -115,6 +134,40 @@ class IssueRunnerPluginTests(unittest.TestCase):
         self.assertEqual(github.add_label_calls, [("nous", "hermes-issue-runner", 4, "agent:in-progress")])
         self.assertIn("Title: Injected title", replies[0])
         self.assertIn("Next runnable child is #4", replies[0])
+
+    def test_plugin_resume_and_continue_dispatch_through_event_path(self) -> None:
+        for verb in ("resume", "continue"):
+            with self.subTest(verb=verb):
+                github = FakeGitHub()
+                github.children = [
+                    {"owner": "nous", "repo": "hermes-issue-runner", "number": 3, "title": "Done", "body": "", "state": "open", "labels": ["ready-for-agent", "agent:done"]},
+                    {"owner": "nous", "repo": "hermes-issue-runner", "number": 4, "title": "Next", "body": "## Blocked by\n\n- #3\n", "state": "open", "labels": ["ready-for-agent"]},
+                ]
+                hooks: list[tuple[str, object]] = []
+                replies: list[str] = []
+
+                async def send(chat_id, content, metadata=None):
+                    replies.append(content)
+
+                ctx = SimpleNamespace(
+                    github_client=github,
+                    authorization_checker=lambda event, gateway: True,
+                    register_hook=lambda name, hook: hooks.append((name, hook)),
+                )
+
+                async def start_child_session(request):
+                    return {"scheduled": True, "request": request}
+
+                gateway = SimpleNamespace(adapters={"discord": SimpleNamespace(send=send)}, start_child_session=start_child_session)
+                plugin.register(ctx)
+
+                result = asyncio.run(plugin.pre_gateway_dispatch(self._event(f"/issue-runner {verb} nous/hermes-issue-runner#2"), gateway))
+
+                self.assertEqual(result, {"action": "skip", "reason": "issue-runner child run started", "child": "4"})
+                self.assertEqual(hooks, [("pre_gateway_dispatch", plugin.pre_gateway_dispatch)])
+                self.assertEqual(github.add_label_calls, [("nous", "hermes-issue-runner", 4, "agent:in-progress")])
+                self.assertIn("Repository: nous/hermes-issue-runner", replies[0])
+                self.assertIn("started gateway child session for #4", replies[0])
 
     def test_build_handler_uses_injected_git_client_seam(self) -> None:
         github = FakeGitHub()

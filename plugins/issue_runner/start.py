@@ -20,6 +20,7 @@ from .state import check_duplicate_run, clear_child_started, ensure_operational_
 
 SLASH_COMMANDS = ("/issue-runner", "/issue_runner")
 START_WORD_RE = re.compile(r"\b(?:start|run|begin)\b", re.IGNORECASE)
+RESUME_WORD_RE = re.compile(r"\b(?:resume|continue)\b", re.IGNORECASE)
 ISSUE_REF_RE = re.compile(
     r"(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)#(?P<number>[1-9][0-9]*)"
 )
@@ -48,11 +49,13 @@ class IssueReference:
 class StartCommand:
     reference: IssueReference
     mode: str
+    action: str = "start"
 
 
 @dataclass(frozen=True)
 class StartIntent:
     mode: str
+    action: str = "start"
 
 
 @dataclass(frozen=True)
@@ -179,13 +182,15 @@ def _slash_command_parts(raw: str) -> tuple[str, str] | None:
     return None
 
 
-def _is_slash_start(raw: str) -> bool:
+def _slash_action(raw: str) -> str | None:
     parts = _slash_command_parts(raw)
     if parts is None:
-        return False
+        return None
     _command, remainder = parts
     first_word = remainder.split(maxsplit=1)[0].lower() if remainder else ""
-    return first_word == "start"
+    if first_word in {"start", "resume", "continue"}:
+        return first_word
+    return None
 
 
 def _looks_like_natural_start(raw: str) -> bool:
@@ -198,20 +203,31 @@ def _looks_like_natural_start(raw: str) -> bool:
     return bool(re.search(r"<@!?\d+>|@\w+", raw))
 
 
+def _looks_like_natural_resume(raw: str) -> bool:
+    if not RESUME_WORD_RE.search(raw):
+        return False
+    if not re.search(r"\bissue[- ]?runner\b", raw, re.IGNORECASE):
+        return False
+    return bool(re.search(r"<@!?\d+>|@\w+", raw))
+
+
 def detect_start_intent(text: str) -> StartIntent | None:
-    """Detect whether text is an issue-runner start request without parsing refs."""
+    """Detect whether text is an issue-runner command without parsing refs."""
     raw = (text or "").strip()
     if not raw:
         return None
-    if _is_slash_start(raw):
-        return StartIntent(mode="slash")
+    slash_action = _slash_action(raw)
+    if slash_action is not None:
+        return StartIntent(mode="slash", action=slash_action)
     if _looks_like_natural_start(raw):
-        return StartIntent(mode="mention")
+        return StartIntent(mode="mention", action="start")
+    if _looks_like_natural_resume(raw):
+        return StartIntent(mode="mention", action="resume")
     return None
 
 
-def parse_start_command(text: str) -> StartCommand | None:
-    """Return a start command for slash-command or natural mention text.
+def parse_issue_runner_command(text: str) -> StartCommand | None:
+    """Return a start/resume command for slash-command or natural mention text.
 
     Non-command text returns ``None``. Command-shaped text with a bad/missing
     parent issue raises ``IssueReferenceError`` so callers can reply with an
@@ -222,12 +238,16 @@ def parse_start_command(text: str) -> StartCommand | None:
         return None
 
     intent = detect_start_intent(raw)
-    if intent and intent.mode == "slash":
-        return StartCommand(reference=parse_issue_reference(raw), mode="slash")
+    if intent is None:
+        return None
+    return StartCommand(reference=parse_issue_reference(raw), mode=intent.mode, action=intent.action)
 
-    if intent and intent.mode == "mention":
-        return StartCommand(reference=parse_issue_reference(raw), mode="mention")
 
+def parse_start_command(text: str) -> StartCommand | None:
+    """Return only start commands, preserving the historical parser API."""
+    command = parse_issue_runner_command(text)
+    if command is not None and command.action == "start":
+        return command
     return None
 
 
@@ -307,6 +327,40 @@ def _coerce_parent_issue(reference: IssueReference, payload: Any) -> ParentIssue
     return ParentIssue(owner=str(owner), repo=str(repo), number=int(number), title=str(title))
 
 
+def _format_parent_run_reply(parent: ParentIssue, run_result: ParentRunResult) -> str:
+    selection = run_result.final_selection
+    child_run = run_result.pending_run or run_result.first_started_run
+    completed_summary = ""
+    if run_result.completed_children:
+        completed_summary = "\nCompleted child runs: " + ", ".join(f"#{child.number}" for child in run_result.completed_children) + "."
+    return (
+        "Resolved Hermes Issue Runner parent issue:\n"
+        f"Repository: {parent.repository}\n"
+        f"Parent issue: #{parent.number}\n"
+        f"Title: {parent.title}\n"
+        f"Child selection: {selection.message}"
+        + completed_summary
+        + (
+            "\nChild run: started gateway child session "
+            f"for #{selection.selected.number} on branch {_child_run_plan(child_run).branch_name}."
+            if selection.has_runnable_child and child_run is not None and run_result.pending_run is not None
+            else ""
+        )
+    )
+
+
+def _handler_result(run_result: ParentRunResult) -> dict[str, str]:
+    selection = run_result.final_selection
+    if run_result.pending_run is not None:
+        assert selection.selected is not None
+        return {
+            "action": "skip",
+            "reason": "issue-runner child run started",
+            "child": str(selection.selected.number),
+        }
+    return {"action": "skip", "reason": selection.status}
+
+
 class StartCommandHandler:
     """Handle the minimal issue-runner start command.
 
@@ -352,7 +406,7 @@ class StartCommandHandler:
             return {"action": "skip", "reason": "unauthorized"}
 
         try:
-            command = parse_start_command(text)
+            command = parse_issue_runner_command(text)
         except IssueReferenceError as exc:
             await _maybe_await(self.reply_sender(event, gateway, f"Invalid parent issue reference: {exc}"))
             return {"action": "skip", "reason": "invalid parent issue reference"}
@@ -375,51 +429,23 @@ class StartCommandHandler:
 
         parent_key = IssueKey(parent.owner, parent.repo, parent.number)
         try:
-            await _maybe_await(ensure_operational_labels(parent.owner, parent.repo, self.github_client))
-            duplicate_guard = await check_duplicate_run(parent_key, self.github_client)
-            if duplicate_guard.has_incomplete_state:
-                await _maybe_await(self.reply_sender(event, gateway, duplicate_guard.message))
-                return {"action": "skip", "reason": "duplicate run in progress"}
-            run_result = await self._run_parent_loop(event=event, gateway=gateway, parent=parent)
-            selection = run_result.final_selection
-            child_run = run_result.pending_run or run_result.first_started_run
+            if command.action in {"resume", "continue"}:
+                run_result = await self.resume_parent(event=event, gateway=gateway, parent=parent_key)
+            else:
+                await _maybe_await(ensure_operational_labels(parent.owner, parent.repo, self.github_client))
+                duplicate_guard = await check_duplicate_run(parent_key, self.github_client)
+                if duplicate_guard.has_incomplete_state:
+                    await _maybe_await(self.reply_sender(event, gateway, duplicate_guard.message))
+                    return {"action": "skip", "reason": "duplicate run in progress"}
+                run_result = await self._run_parent_loop(event=event, gateway=gateway, parent=parent)
         except ChildStartupError as exc:
             await _maybe_await(self.reply_sender(event, gateway, str(exc)))
             return {"action": "skip", "reason": exc.reason}
         except Exception as exc:
             await _maybe_await(self.reply_sender(event, gateway, f"Unable to advance parent issue {parent_key.ref}: {exc}"))
             return {"action": "skip", "reason": "parent run failed"}
-        completed_summary = ""
-        if run_result.completed_children:
-            completed_summary = "\nCompleted child runs: " + ", ".join(f"#{child.number}" for child in run_result.completed_children) + "."
-        await _maybe_await(
-            self.reply_sender(
-                event,
-                gateway,
-                (
-                    "Resolved Hermes Issue Runner parent issue:\n"
-                    f"Repository: {parent.repository}\n"
-                    f"Parent issue: #{parent.number}\n"
-                    f"Title: {parent.title}\n"
-                    f"Child selection: {selection.message}"
-                    + completed_summary
-                    + (
-                        "\nChild run: started gateway child session "
-                        f"for #{selection.selected.number} on branch {_child_run_plan(child_run).branch_name}."
-                        if selection.has_runnable_child and child_run is not None and run_result.pending_run is not None
-                        else ""
-                    )
-                ),
-            )
-        )
-        if run_result.pending_run is not None:
-            assert selection.selected is not None
-            return {
-                "action": "skip",
-                "reason": "issue-runner child run started",
-                "child": str(selection.selected.number),
-            }
-        return {"action": "skip", "reason": selection.status}
+        await _maybe_await(self.reply_sender(event, gateway, _format_parent_run_reply(parent, run_result)))
+        return _handler_result(run_result)
 
     def _get_issue(self, reference: IssueReference) -> Any:
         getter = getattr(self.github_client, "get_issue", None)
@@ -434,6 +460,7 @@ class StartCommandHandler:
 
     async def _start_selected_child(self, *, event: Any, gateway: Any, parent_key: IssueKey, child: Any) -> Any:
         prepared_plan = prepare_child_run(parent=parent_key, child=child)
+        await _maybe_await(mark_child_started(child, self.github_client))
         try:
             branch_preparation = await _maybe_await(
                 self.branch_preparer(
@@ -445,12 +472,12 @@ class StartCommandHandler:
                 )
             )
         except Exception as exc:
+            await _maybe_await(clear_child_started(child, self.github_client))
             raise ChildStartupError(
                 "branch preparation failed",
-                f"Unable to prepare branch for child #{child.number}: {exc}",
+                f"Unable to prepare branch for child #{child.number}; cleaned up in-progress label: {exc}",
             ) from exc
 
-        await _maybe_await(mark_child_started(child, self.github_client))
         try:
             child_run = await _maybe_await(
                 self.child_session_starter(
