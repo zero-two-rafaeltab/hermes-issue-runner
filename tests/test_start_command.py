@@ -150,6 +150,83 @@ class StartCommandTests(unittest.TestCase):
         self.assertIn("Parent issue: #1", replies[0])
         self.assertIn("Title: PRD: Hermes Issue Runner MVP", replies[0])
 
+    def test_git_client_is_passed_to_branch_preparer(self) -> None:
+        github = FakeGitHub()
+        git_client = SimpleNamespace(name="git-seam")
+        seen: list[object] = []
+        replies: list[str] = []
+
+        async def reply_sender(event, gateway, message: str) -> bool:
+            replies.append(message)
+            return True
+
+        async def branch_preparer(**kwargs):
+            seen.append(kwargs.get("git_client"))
+            return SimpleNamespace(base_branch="main", pr_base="main")
+
+        async def child_session_starter(**kwargs):
+            return SimpleNamespace(plan=prepare_child_run(parent=kwargs["parent"], child=kwargs["child"]))
+
+        handler = StartCommandHandler(
+            github,
+            authorization_checker=lambda event, gateway: True,
+            reply_sender=reply_sender,
+            child_session_starter=child_session_starter,
+            branch_preparer=branch_preparer,
+            git_client=git_client,
+        )
+        result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#1"), SimpleNamespace()))
+
+        self.assertEqual(result, {"action": "skip", "reason": "issue-runner child run started", "child": "9"})
+        self.assertEqual(seen, [git_client])
+        self.assertEqual(github.add_label_calls, [("nous", "hermes-issue-runner", 9, "agent:in-progress")])
+
+    def test_branch_preparation_failure_does_not_mark_child_started(self) -> None:
+        github = FakeGitHub()
+        replies: list[str] = []
+
+        async def reply_sender(event, gateway, message: str) -> bool:
+            replies.append(message)
+            return True
+
+        async def branch_preparer(**kwargs):
+            raise RuntimeError("branch prep failed")
+
+        handler = StartCommandHandler(
+            github,
+            authorization_checker=lambda event, gateway: True,
+            reply_sender=reply_sender,
+            branch_preparer=branch_preparer,
+        )
+        result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#1"), SimpleNamespace()))
+
+        self.assertEqual(result, {"action": "skip", "reason": "github issue lookup failed"})
+        self.assertEqual(github.add_label_calls, [])
+        self.assertIn("branch prep failed", replies[0])
+
+    def test_child_session_failure_does_not_mark_child_started(self) -> None:
+        github = FakeGitHub()
+        replies: list[str] = []
+
+        async def reply_sender(event, gateway, message: str) -> bool:
+            replies.append(message)
+            return True
+
+        async def child_session_starter(**kwargs):
+            raise RuntimeError("session failed")
+
+        handler = StartCommandHandler(
+            github,
+            authorization_checker=lambda event, gateway: True,
+            reply_sender=reply_sender,
+            child_session_starter=child_session_starter,
+        )
+        result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#1"), SimpleNamespace()))
+
+        self.assertEqual(result, {"action": "skip", "reason": "github issue lookup failed"})
+        self.assertEqual(github.add_label_calls, [])
+        self.assertIn("session failed", replies[0])
+
     def test_authorized_natural_mention_resolves_same_behavior(self) -> None:
         handler, github, replies = self._handler(allowed=True)
         event = self._event("@Hermes start issue runner for nous/hermes-issue-runner#1")

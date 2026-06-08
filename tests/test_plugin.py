@@ -116,6 +116,24 @@ class IssueRunnerPluginTests(unittest.TestCase):
         self.assertIn("Title: Injected title", replies[0])
         self.assertIn("Next runnable child is #4", replies[0])
 
+    def test_build_handler_uses_injected_git_client_seam(self) -> None:
+        github = FakeGitHub()
+        git_client = SimpleNamespace(name="git")
+        handler = plugin._build_handler(SimpleNamespace(github_client=github, git_client=git_client))
+
+        self.assertIs(handler.github_client, github)
+        self.assertIs(handler.git_client, git_client)
+
+    def test_build_handler_uses_issue_runner_git_client_fallback(self) -> None:
+        github = FakeGitHub()
+        git_client = SimpleNamespace(name="fallback-git")
+        handler = plugin._build_handler(
+            SimpleNamespace(issue_runner_github_client=github, issue_runner_git_client=git_client)
+        )
+
+        self.assertIs(handler.github_client, github)
+        self.assertIs(handler.git_client, git_client)
+
     def test_unconfigured_github_client_returns_actionable_error(self) -> None:
         replies: list[str] = []
 

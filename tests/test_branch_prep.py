@@ -44,9 +44,7 @@ class BranchPreparationTests(unittest.TestCase):
             plan.git_commands,
             (
                 ("git", "fetch", "origin"),
-                ("git", "checkout", "main"),
-                ("git", "pull", "--ff-only", "origin", "main"),
-                ("git", "checkout", "-B", "feat/issue-7", "main"),
+                ("git", "checkout", "-B", "feat/issue-7", "origin/main"),
             ),
         )
 
@@ -61,7 +59,15 @@ class BranchPreparationTests(unittest.TestCase):
         self.assertEqual(plan.base_branch, "feat/issue-6-child-run-prompt")
         self.assertEqual(plan.pr_base, "main")
         self.assertEqual(plan.additional_rebase_branches, ())
-        self.assertIn(("git", "checkout", "-B", "feat/issue-7", "feat/issue-6-child-run-prompt"), plan.git_commands)
+        self.assertEqual(
+            plan.git_commands,
+            (
+                ("git", "fetch", "origin"),
+                ("git", "checkout", "-B", "feat/issue-7", "origin/feat/issue-6-child-run-prompt"),
+            ),
+        )
+        self.assertNotIn(("git", "checkout", "feat/issue-6-child-run-prompt"), plan.git_commands)
+        self.assertNotIn(("git", "pull", "--ff-only", "origin", "feat/issue-6-child-run-prompt"), plan.git_commands)
 
     def test_multiple_dependencies_choose_fewest_rebases_from_issue_graph(self) -> None:
         github = FakeGitHub()
@@ -83,7 +89,10 @@ class BranchPreparationTests(unittest.TestCase):
 
         self.assertEqual(plan.base_branch, "feat/issue-6")
         self.assertEqual([item.branch for item in plan.additional_rebase_branches], ["feat/issue-9"])
-        self.assertIn(("git", "rebase", "feat/issue-9"), plan.git_commands)
+        self.assertIn(("git", "checkout", "-B", "feat/issue-10", "origin/feat/issue-6"), plan.git_commands)
+        self.assertIn(("git", "rebase", "origin/feat/issue-9"), plan.git_commands)
+        self.assertNotIn(("git", "checkout", "feat/issue-9"), plan.git_commands)
+        self.assertNotIn(("git", "pull", "--ff-only", "origin", "feat/issue-9"), plan.git_commands)
 
     def test_git_containment_can_verify_extra_coverage(self) -> None:
         github = FakeGitHub()
@@ -138,7 +147,7 @@ class BranchPreparationTests(unittest.TestCase):
 
         with self.assertRaises(BranchPreparationFailure):
             asyncio.run(execute_branch_preparation(plan, run))
-        self.assertIn(("git", "rebase", "feat/issue-9"), calls)
+        self.assertIn(("git", "rebase", "origin/feat/issue-9"), calls)
 
 
 if __name__ == "__main__":

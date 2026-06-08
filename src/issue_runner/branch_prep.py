@@ -164,14 +164,13 @@ async def _verify_git_coverage(
 
 
 def _commands_for(plan: BranchPreparationPlan) -> tuple[tuple[str, ...], ...]:
+    base_ref = f"origin/{plan.base_branch}"
     commands: list[tuple[str, ...]] = [
         ("git", "fetch", "origin"),
-        ("git", "checkout", plan.base_branch),
-        ("git", "pull", "--ff-only", "origin", plan.base_branch),
-        ("git", "checkout", "-B", plan.child_branch, plan.base_branch),
+        ("git", "checkout", "-B", plan.child_branch, base_ref),
     ]
     for dependency in plan.additional_rebase_branches:
-        commands.append(("git", "rebase", dependency.branch))
+        commands.append(("git", "rebase", f"origin/{dependency.branch}"))
     return tuple(commands)
 
 

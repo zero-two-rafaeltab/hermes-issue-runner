@@ -254,8 +254,10 @@ class StartCommandHandler:
         reply_sender: Callable[[Any, Any, str], Any] | None = None,
         child_session_starter: Callable[..., Any] | None = None,
         branch_preparer: Callable[..., Any] | None = None,
+        git_client: Any | None = None,
     ) -> None:
         self.github_client = github_client
+        self.git_client = git_client
         self.authorization_checker = authorization_checker or default_authorization_checker
         self.reply_sender = reply_sender or send_discord_reply
         self.child_session_starter = child_session_starter or start_child_issue_session
@@ -303,13 +305,13 @@ class StartCommandHandler:
             selection = await self._select_next_child(parent)
             if selection.has_runnable_child:
                 assert selection.selected is not None
-                await _maybe_await(mark_child_started(selection.selected, self.github_client))
                 prepared_plan = prepare_child_run(parent=parent_key, child=selection.selected)
                 branch_preparation = await _maybe_await(
                     self.branch_preparer(
                         child=selection.selected,
                         child_branch=prepared_plan.branch_name,
                         github_client=self.github_client,
+                        git_client=self.git_client,
                         pr_base="main",
                     )
                 )
@@ -324,6 +326,7 @@ class StartCommandHandler:
                         branch_preparation=branch_preparation,
                     )
                 )
+                await _maybe_await(mark_child_started(selection.selected, self.github_client))
         except Exception as exc:
             await _maybe_await(
                 self.reply_sender(

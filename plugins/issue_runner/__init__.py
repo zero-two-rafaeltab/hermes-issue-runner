@@ -33,7 +33,11 @@ def _build_handler(ctx: Any | None = None) -> StartCommandHandler:
     if auth_checker is None:
         auth_checker = getattr(ctx, "issue_runner_authorization_checker", None) if ctx is not None else None
 
-    return StartCommandHandler(github_client=github_client, authorization_checker=auth_checker)
+    git_client = getattr(ctx, "git_client", None) if ctx is not None else None
+    if git_client is None:
+        git_client = getattr(ctx, "issue_runner_git_client", None) if ctx is not None else None
+
+    return StartCommandHandler(github_client=github_client, authorization_checker=auth_checker, git_client=git_client)
 
 
 _handler = _build_handler()
