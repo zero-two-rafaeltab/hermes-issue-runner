@@ -1,0 +1,6 @@
+name: issue_runner
+version: 0.1.0
+description: Minimal Hermes Issue Runner start command for Discord.
+kind: standalone
+provides_hooks:
+  - pre_gateway_dispatch

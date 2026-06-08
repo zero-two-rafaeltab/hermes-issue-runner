@@ -24,10 +24,9 @@ class SeamInspectionTests(unittest.TestCase):
         self.assertTrue(probe.base_create_handoff_thread_found)
         self.assertTrue(probe.discord_create_handoff_thread_found)
         self.assertTrue(probe.gateway_process_handoff_found)
-        # This spike documents the current blocker. If this assertion starts
-        # failing, Hermes likely gained the public seam and the technical note
-        # should be updated to exercise it.
-        self.assertFalse(probe.public_start_child_session_found)
+        # Hermes core prerequisite #15 has landed; the public child-session seam
+        # should now be discoverable for downstream issue-runner slices.
+        self.assertTrue(probe.public_start_child_session_found)
 
 
 class PrototypePluginTests(unittest.TestCase):
