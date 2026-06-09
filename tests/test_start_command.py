@@ -21,10 +21,25 @@ from issue_runner.start import (
 class FakeGitHub:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, int]] = []
+        self.child_calls: list[tuple[str, str, int]] = []
 
     def get_issue(self, owner: str, repo: str, number: int) -> dict[str, object]:
         self.calls.append((owner, repo, number))
         return {"owner": owner, "repo": repo, "number": number, "title": "PRD: Hermes Issue Runner MVP"}
+
+    def list_child_issues(self, owner: str, repo: str, parent_number: int) -> list[dict[str, object]]:
+        self.child_calls.append((owner, repo, parent_number))
+        return [
+            {
+                "owner": owner,
+                "repo": repo,
+                "number": 9,
+                "title": "Runnable child",
+                "body": "",
+                "state": "open",
+                "labels": ["ready-for-agent"],
+            }
+        ]
 
 
 class StartCommandTests(unittest.TestCase):
@@ -101,7 +116,7 @@ class StartCommandTests(unittest.TestCase):
     def test_authorized_slash_command_resolves_and_replies(self) -> None:
         handler, github, replies = self._handler(allowed=True)
         result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#1"), SimpleNamespace()))
-        self.assertEqual(result, {"action": "skip", "reason": "issue-runner start resolved"})
+        self.assertEqual(result, {"action": "skip", "reason": "issue-runner child selected", "child": "9"})
         self.assertEqual(github.calls, [("nous", "hermes-issue-runner", 1)])
         self.assertEqual(len(replies), 1)
         self.assertIn("Repository: nous/hermes-issue-runner", replies[0])
@@ -112,7 +127,7 @@ class StartCommandTests(unittest.TestCase):
         handler, github, replies = self._handler(allowed=True)
         event = self._event("@Hermes start issue runner for nous/hermes-issue-runner#1")
         result = asyncio.run(handler.handle(event, SimpleNamespace()))
-        self.assertEqual(result, {"action": "skip", "reason": "issue-runner start resolved"})
+        self.assertEqual(result, {"action": "skip", "reason": "issue-runner child selected", "child": "9"})
         self.assertEqual(github.calls, [("nous", "hermes-issue-runner", 1)])
         self.assertIn("Repository: nous/hermes-issue-runner", replies[0])
 
@@ -173,7 +188,7 @@ class StartCommandTests(unittest.TestCase):
         gateway = SimpleNamespace(_is_user_authorized=lambda source: source.user_id == "u1")
         handler = StartCommandHandler(github, reply_sender=reply_sender)
         result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#1", user_id="u1"), gateway))
-        self.assertEqual(result, {"action": "skip", "reason": "issue-runner start resolved"})
+        self.assertEqual(result, {"action": "skip", "reason": "issue-runner child selected", "child": "9"})
         self.assertEqual(github.calls, [("nous", "hermes-issue-runner", 1)])
 
         result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#2", user_id="u2"), gateway))
@@ -212,7 +227,7 @@ class StartCommandTests(unittest.TestCase):
         gateway = SimpleNamespace(is_user_authorized=is_user_authorized)
         handler = StartCommandHandler(github, reply_sender=reply_sender)
         result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#1"), gateway))
-        self.assertEqual(result, {"action": "skip", "reason": "issue-runner start resolved"})
+        self.assertEqual(result, {"action": "skip", "reason": "issue-runner child selected", "child": "9"})
         self.assertEqual(github.calls, [("nous", "hermes-issue-runner", 1)])
         self.assertIn("Title: PRD: Hermes Issue Runner MVP", replies[0])
 

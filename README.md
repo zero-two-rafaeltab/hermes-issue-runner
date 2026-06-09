@@ -2,7 +2,7 @@
 
 A Hermes gateway plugin for running GitHub sub-issues through auditable agent implementation workflows from Discord.
 
-This repository currently contains the issue #2 technical spike artifact plus the first minimal issue-runner start command surface for Discord.
+This repository currently contains the issue #2 technical spike artifact, the first minimal issue-runner start command surface for Discord, and issue #4 child discovery/selection behavior for ready child issues and blockers.
 
 ## Spike #2 result
 
@@ -19,6 +19,7 @@ Short version:
 
 - `plugins/issue_runner/` — minimal Discord start command plugin entrypoint.
 - `src/issue_runner/start.py` — parser/handler for slash and mention start commands with injected auth/GitHub seams.
+- `src/issue_runner/selection.py` — pure GitHub child discovery, `ready-for-agent` filtering, blocker parsing, and deterministic next-child selection.
 - `plugins/issue_runner_spike/` — minimal plugin prototype for a `/issue-runner-spike` text trigger.
 - `src/issue_runner_spike/seam.py` — source-inspection/seam model and CLI smoke-check helper.
 - `tests/test_start_command.py` — unit tests for issue #3 start command behavior.
@@ -41,9 +42,14 @@ It also recognizes mention-oriented natural language, for example:
 
 The handler reuses Hermes Discord authorization through the injected gateway
 authorization predicate (for example `_is_user_authorized`) and requires an
-injected GitHub client with `get_issue(owner, repo, number)` for live use. The
-plugin imports the handler as `issue_runner.start`; for direct local imports from
-a checkout, put `src/` on `PYTHONPATH` (the plugin does this for its repository
+injected GitHub client with `get_issue(owner, repo, number)` plus one child
+discovery method: `list_child_issues(owner, repo, parent_number)`,
+`list_sub_issues(...)`, or `get_child_issues(...)`. Child issues are eligible
+only when labeled `ready-for-agent`; blockers are parsed from each child issue's
+`## Blocked by` section as `#N` references or GitHub issue links. A blocker is
+satisfied when the referenced issue is closed or labeled `agent:done`. The plugin
+imports the handler as `issue_runner.start`; for direct local imports from a
+checkout, put `src/` on `PYTHONPATH` (the plugin does this for its repository
 layout during registration/tests).
 
 ## Local smoke checks

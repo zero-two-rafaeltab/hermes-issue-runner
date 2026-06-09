@@ -20,10 +20,17 @@ from plugins import issue_runner as plugin
 class FakeGitHub:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, int]] = []
+        self.child_calls: list[tuple[str, str, int]] = []
 
     def get_issue(self, owner: str, repo: str, number: int) -> dict[str, object]:
         self.calls.append((owner, repo, number))
         return {"owner": owner, "repo": repo, "number": number, "title": "Injected title"}
+
+    def list_child_issues(self, owner: str, repo: str, parent_number: int) -> list[dict[str, object]]:
+        self.child_calls.append((owner, repo, parent_number))
+        return [
+            {"owner": owner, "repo": repo, "number": 4, "title": "Child", "labels": ["ready-for-agent"]}
+        ]
 
 
 class IssueRunnerPluginTests(unittest.TestCase):
@@ -60,6 +67,7 @@ class IssueRunnerPluginTests(unittest.TestCase):
             try:
                 standalone_plugin = importlib.import_module("issue_runner")
                 standalone_start = importlib.import_module("issue_runner.start")
+                standalone_selection = importlib.import_module("issue_runner.selection")
             finally:
                 for name in list(sys.modules):
                     if name == "issue_runner" or name.startswith("issue_runner."):
@@ -68,6 +76,7 @@ class IssueRunnerPluginTests(unittest.TestCase):
                 sys.path[:] = original_path
 
         self.assertIs(standalone_plugin.StartCommandHandler, standalone_start.StartCommandHandler)
+        self.assertTrue(callable(standalone_selection.select_next_child))
         self.assertTrue(callable(standalone_plugin.register))
 
     def test_register_uses_injected_github_and_auth_seams(self) -> None:
@@ -89,9 +98,11 @@ class IssueRunnerPluginTests(unittest.TestCase):
         self.assertEqual(hooks, [("pre_gateway_dispatch", plugin.pre_gateway_dispatch)])
 
         result = asyncio.run(plugin.pre_gateway_dispatch(self._event("/issue-runner start nous/hermes-issue-runner#3"), gateway))
-        self.assertEqual(result, {"action": "skip", "reason": "issue-runner start resolved"})
+        self.assertEqual(result, {"action": "skip", "reason": "issue-runner child selected", "child": "4"})
         self.assertEqual(github.calls, [("nous", "hermes-issue-runner", 3)])
+        self.assertEqual(github.child_calls, [("nous", "hermes-issue-runner", 3)])
         self.assertIn("Title: Injected title", replies[0])
+        self.assertIn("Next runnable child is #4", replies[0])
 
     def test_unconfigured_github_client_returns_actionable_error(self) -> None:
         replies: list[str] = []
