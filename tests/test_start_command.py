@@ -10,6 +10,7 @@ _SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+from issue_runner.child_run import prepare_child_run
 from issue_runner.start import (
     IssueReferenceError,
     StartCommandHandler,
@@ -74,7 +75,19 @@ class StartCommandTests(unittest.TestCase):
         def auth_checker(event, gateway) -> bool:
             return allowed
 
-        return StartCommandHandler(github, authorization_checker=auth_checker, reply_sender=reply_sender), github, replies
+        async def child_session_starter(**kwargs):
+            return SimpleNamespace(plan=prepare_child_run(parent=kwargs["parent"], child=kwargs["child"]))
+
+        return (
+            StartCommandHandler(
+                github,
+                authorization_checker=auth_checker,
+                reply_sender=reply_sender,
+                child_session_starter=child_session_starter,
+            ),
+            github,
+            replies,
+        )
 
     def test_parse_owner_repo_issue_reference(self) -> None:
         ref = parse_issue_reference("please use nous/hermes-issue-runner#123")
@@ -125,7 +138,7 @@ class StartCommandTests(unittest.TestCase):
     def test_authorized_slash_command_resolves_and_replies(self) -> None:
         handler, github, replies = self._handler(allowed=True)
         result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#1"), SimpleNamespace()))
-        self.assertEqual(result, {"action": "skip", "reason": "issue-runner child selected", "child": "9"})
+        self.assertEqual(result, {"action": "skip", "reason": "issue-runner child run started", "child": "9"})
         self.assertEqual(github.calls, [("nous", "hermes-issue-runner", 1)])
         self.assertEqual(
             github.ensure_calls,
@@ -141,7 +154,7 @@ class StartCommandTests(unittest.TestCase):
         handler, github, replies = self._handler(allowed=True)
         event = self._event("@Hermes start issue runner for nous/hermes-issue-runner#1")
         result = asyncio.run(handler.handle(event, SimpleNamespace()))
-        self.assertEqual(result, {"action": "skip", "reason": "issue-runner child selected", "child": "9"})
+        self.assertEqual(result, {"action": "skip", "reason": "issue-runner child run started", "child": "9"})
         self.assertEqual(github.calls, [("nous", "hermes-issue-runner", 1)])
         self.assertEqual(github.add_label_calls, [("nous", "hermes-issue-runner", 9, "agent:in-progress")])
         self.assertIn("Repository: nous/hermes-issue-runner", replies[0])
@@ -198,9 +211,17 @@ class StartCommandTests(unittest.TestCase):
             replies.append(message)
             return True
 
-        handler = StartCommandHandler(github, authorization_checker=lambda event, gateway: True, reply_sender=reply_sender)
+        async def child_session_starter(**kwargs):
+            return SimpleNamespace(plan=prepare_child_run(parent=kwargs["parent"], child=kwargs["child"]))
+
+        handler = StartCommandHandler(
+            github,
+            authorization_checker=lambda event, gateway: True,
+            reply_sender=reply_sender,
+            child_session_starter=child_session_starter,
+        )
         result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#1"), SimpleNamespace()))
-        self.assertEqual(result, {"action": "skip", "reason": "issue-runner child selected", "child": "9"})
+        self.assertEqual(result, {"action": "skip", "reason": "issue-runner child run started", "child": "9"})
         self.assertEqual(github.calls, [("nous", "hermes-issue-runner", 1)])
         self.assertEqual(github.child_calls, [("nous", "hermes-issue-runner", 1), ("nous", "hermes-issue-runner", 1)])
         self.assertEqual(github.add_label_calls, [("nous", "hermes-issue-runner", 9, "agent:in-progress")])
@@ -260,10 +281,13 @@ class StartCommandTests(unittest.TestCase):
             replies.append(message)
             return True
 
-        gateway = SimpleNamespace(_is_user_authorized=lambda source: source.user_id == "u1")
+        async def start_child_session(request):
+            return {"scheduled": True, "request": request}
+
+        gateway = SimpleNamespace(_is_user_authorized=lambda source: source.user_id == "u1", start_child_session=start_child_session)
         handler = StartCommandHandler(github, reply_sender=reply_sender)
         result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#1", user_id="u1"), gateway))
-        self.assertEqual(result, {"action": "skip", "reason": "issue-runner child selected", "child": "9"})
+        self.assertEqual(result, {"action": "skip", "reason": "issue-runner child run started", "child": "9"})
         self.assertEqual(github.calls, [("nous", "hermes-issue-runner", 1)])
 
         result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#2", user_id="u2"), gateway))
@@ -299,10 +323,13 @@ class StartCommandTests(unittest.TestCase):
         async def is_user_authorized(source) -> bool:
             return True
 
-        gateway = SimpleNamespace(is_user_authorized=is_user_authorized)
+        async def start_child_session(request):
+            return {"scheduled": True, "request": request}
+
+        gateway = SimpleNamespace(is_user_authorized=is_user_authorized, start_child_session=start_child_session)
         handler = StartCommandHandler(github, reply_sender=reply_sender)
         result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#1"), gateway))
-        self.assertEqual(result, {"action": "skip", "reason": "issue-runner child selected", "child": "9"})
+        self.assertEqual(result, {"action": "skip", "reason": "issue-runner child run started", "child": "9"})
         self.assertEqual(github.calls, [("nous", "hermes-issue-runner", 1)])
         self.assertIn("Title: PRD: Hermes Issue Runner MVP", replies[0])
 

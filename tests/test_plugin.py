@@ -100,13 +100,16 @@ class IssueRunnerPluginTests(unittest.TestCase):
             authorization_checker=lambda event, gateway: True,
             register_hook=lambda name, hook: hooks.append((name, hook)),
         )
-        gateway = SimpleNamespace(adapters={"discord": SimpleNamespace(send=send)})
+        async def start_child_session(request):
+            return {"scheduled": True, "request": request}
+
+        gateway = SimpleNamespace(adapters={"discord": SimpleNamespace(send=send)}, start_child_session=start_child_session)
 
         plugin.register(ctx)
         self.assertEqual(hooks, [("pre_gateway_dispatch", plugin.pre_gateway_dispatch)])
 
         result = asyncio.run(plugin.pre_gateway_dispatch(self._event("/issue-runner start nous/hermes-issue-runner#3"), gateway))
-        self.assertEqual(result, {"action": "skip", "reason": "issue-runner child selected", "child": "4"})
+        self.assertEqual(result, {"action": "skip", "reason": "issue-runner child run started", "child": "4"})
         self.assertEqual(github.calls, [("nous", "hermes-issue-runner", 3)])
         self.assertEqual(github.child_calls, [("nous", "hermes-issue-runner", 3), ("nous", "hermes-issue-runner", 3)])
         self.assertEqual(github.add_label_calls, [("nous", "hermes-issue-runner", 4, "agent:in-progress")])
