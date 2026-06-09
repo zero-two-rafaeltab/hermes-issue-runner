@@ -426,13 +426,13 @@ class StartCommandTests(unittest.TestCase):
         )
         result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#1"), SimpleNamespace()))
 
-        self.assertEqual(result, {"action": "skip", "reason": "failure pause pending"})
+        self.assertEqual(result, {"action": "skip", "reason": "failure pause unavailable"})
         self.assertEqual(github.add_label_calls, [("nous", "hermes-issue-runner", 9, "agent:in-progress")])
         self.assertEqual(github.remove_label_calls, [])
         self.assertEqual(len(replies), 1)
         self.assertIn("in-progress label is preserved", replies[0])
         self.assertIn("branch prep failed", replies[0])
-        self.assertIn("Recovery waiter is unavailable", replies[0])
+        self.assertIn("recovery waiting is not configured", replies[0])
         self.assertIn("rerun manually or configure", replies[0])
 
     def test_child_session_failure_cleans_up_reserved_child_label(self) -> None:
@@ -454,12 +454,12 @@ class StartCommandTests(unittest.TestCase):
         )
         result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#1"), SimpleNamespace()))
 
-        self.assertEqual(result, {"action": "skip", "reason": "failure pause pending"})
+        self.assertEqual(result, {"action": "skip", "reason": "failure pause unavailable"})
         self.assertEqual(github.add_label_calls, [("nous", "hermes-issue-runner", 9, "agent:in-progress")])
         self.assertEqual(github.remove_label_calls, [])
         self.assertEqual(len(replies), 1)
         self.assertIn("session failed", replies[0])
-        self.assertIn("Recovery waiter is unavailable", replies[0])
+        self.assertIn("recovery waiting is not configured", replies[0])
 
     def test_failure_recovery_waits_for_strict_authorized_stop_without_mutating_state(self) -> None:
         github = FakeGitHub()

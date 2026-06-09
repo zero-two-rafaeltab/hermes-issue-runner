@@ -104,6 +104,56 @@ def _value_from_result(result: Any, name: str) -> Any:
     return getattr(result, name, None)
 
 
+def _first_result_value(result: Any, *names: str) -> Any:
+    for candidate in (result, _value_from_result(result, "result"), _value_from_result(result, "metadata")):
+        if candidate is None:
+            continue
+        for name in names:
+            value = _value_from_result(candidate, name)
+            if value is not None:
+                return value
+    return None
+
+
+def _failure_source_from_result(result: Any) -> Any:
+    event = _first_result_value(result, "failure_event", "event", "source_event")
+    source = _first_result_value(result, "failure_source", "source")
+    if source is None and event is not None:
+        source = getattr(event, "source", None)
+    return source
+
+
+def _failure_thread_url_from_result(result: Any) -> str | None:
+    value = _first_result_value(result, "failure_thread_url", "thread_url", "source_url", "url")
+    return None if value is None else str(value)
+
+
+def _failure_event_from_result(result: Any) -> Any:
+    return _first_result_value(result, "failure_event", "event", "source_event")
+
+
+def _failure_source_from_exception(exc: BaseException) -> Any:
+    event = getattr(exc, "failure_event", None) or getattr(exc, "event", None) or getattr(exc, "source_event", None)
+    source = getattr(exc, "failure_source", None) or getattr(exc, "source", None)
+    if source is None and event is not None:
+        source = getattr(event, "source", None)
+    return source
+
+
+def _failure_event_from_exception(exc: BaseException) -> Any:
+    return getattr(exc, "failure_event", None) or getattr(exc, "event", None) or getattr(exc, "source_event", None)
+
+
+def _failure_thread_url_from_exception(exc: BaseException) -> str | None:
+    value = (
+        getattr(exc, "failure_thread_url", None)
+        or getattr(exc, "thread_url", None)
+        or getattr(exc, "source_url", None)
+        or getattr(exc, "url", None)
+    )
+    return None if value is None else str(value)
+
+
 def _child_run_plan(child_run: Any) -> Any:
     return _value_from_result(child_run, "plan")
 
@@ -162,11 +212,23 @@ def _child_run_failed(child_run: Any) -> bool:
 class ChildStartupError(RuntimeError):
     """Raised when branch prep or child session startup fails after selection."""
 
-    def __init__(self, reason: str, message: str, child: Any | None = None, parent: IssueKey | None = None) -> None:
+    def __init__(
+        self,
+        reason: str,
+        message: str,
+        child: Any | None = None,
+        parent: IssueKey | None = None,
+        failure_event: Any | None = None,
+        failure_source: Any | None = None,
+        thread_url: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.reason = reason
         self.child = child
         self.parent = parent
+        self.failure_event = failure_event
+        self.failure_source = failure_source
+        self.thread_url = thread_url
 
 
 class FailureRecoveryStopped(ChildStartupError):
@@ -479,7 +541,7 @@ class StartCommandHandler:
             return {"action": "skip", "reason": "failure recovery: stop"}
         except ChildStartupError as exc:
             await self._report_unconfigured_failure_pause(event=event, gateway=gateway, failure=exc)
-            return {"action": "skip", "reason": "failure pause pending"}
+            return {"action": "skip", "reason": "failure pause unavailable"}
         except Exception as exc:
             await _maybe_await(self.reply_sender(event, gateway, f"Unable to advance parent issue {parent_key.ref}: {exc}"))
             return {"action": "skip", "reason": "parent run failed"}
@@ -503,6 +565,9 @@ class StartCommandHandler:
             parent_issue=parent.ref,
             child_issue=str(child_ref or "unknown child"),
             failure_summary=str(failure),
+            thread_url=failure.thread_url,
+            failure_event=failure.failure_event,
+            failure_source=failure.failure_source,
         )
 
     async def _pause_for_failure_recovery(self, *, event: Any, gateway: Any, failure: ChildStartupError) -> Any:
@@ -520,19 +585,19 @@ class StartCommandHandler:
     async def _report_unconfigured_failure_pause(self, *, event: Any, gateway: Any, failure: ChildStartupError) -> None:
         parent = failure.parent or IssueKey("unknown", "unknown", 0)
         request = self._failure_recovery_request(parent, failure)
+        location = f"\nFailure thread: {request.thread_url}" if request.thread_url else ""
         message = (
-            "Hermes Issue Runner paused after a child attempt failure.\n"
+            "Hermes Issue Runner detected a child attempt failure, but recovery waiting is not configured.\n"
             f"Parent: {request.parent_issue}\n"
             f"Child: {request.child_issue}\n"
             f"Attempt: {request.attempt}\n"
-            f"Failure: {request.failure_summary}\n"
-            "Recovery waiter is unavailable, so this process cannot consume `retry` or `stop` replies here. "
+            f"Failure: {request.failure_summary}{location}\n"
+            "This process cannot consume `retry` or `stop` replies here. "
             "The in-progress label is preserved; an operator must rerun manually or configure the recovery_response_waiter seam."
         )
         await _maybe_await(self.reply_sender(event, gateway, message))
 
     async def _run_parent_loop_with_recovery(self, *, event: Any, gateway: Any, parent: ParentIssue) -> ParentRunResult:
-        retry_count = 0
         while True:
             try:
                 return await self._run_parent_loop(event=event, gateway=gateway, parent=parent)
@@ -546,14 +611,9 @@ class StartCommandHandler:
                         f"{exc} (stopped by operator)",
                         child=exc.child,
                         parent=exc.parent,
-                    ) from exc
-                retry_count += 1
-                if retry_count > 10:
-                    raise ChildStartupError(
-                        exc.reason,
-                        f"{exc} (retry limit exceeded)",
-                        child=exc.child,
-                        parent=exc.parent,
+                        failure_event=exc.failure_event,
+                        failure_source=exc.failure_source,
+                        thread_url=exc.thread_url,
                     ) from exc
 
     async def _select_next_child(self, parent: ParentIssue) -> Any:
@@ -578,6 +638,9 @@ class StartCommandHandler:
                 f"Unable to prepare branch for child #{child.number}; paused with in-progress label preserved: {exc}",
                 child=child,
                 parent=parent_key,
+                failure_event=_failure_event_from_exception(exc),
+                failure_source=_failure_source_from_exception(exc),
+                thread_url=_failure_thread_url_from_exception(exc),
             ) from exc
 
         try:
@@ -598,6 +661,9 @@ class StartCommandHandler:
                 f"Unable to start child session for child #{child.number}; paused with in-progress label preserved: {exc}",
                 child=child,
                 parent=parent_key,
+                failure_event=_failure_event_from_exception(exc),
+                failure_source=_failure_source_from_exception(exc),
+                thread_url=_failure_thread_url_from_exception(exc),
             ) from exc
         if _child_run_failed(child_run):
             status = _value_from_result(child_run, "status")
@@ -608,6 +674,9 @@ class StartCommandHandler:
                 f"Child session for child #{child.number} reported failure status; paused with in-progress label preserved: {detail}",
                 child=child,
                 parent=parent_key,
+                failure_event=_failure_event_from_result(child_run),
+                failure_source=_failure_source_from_result(child_run),
+                thread_url=_failure_thread_url_from_result(child_run),
             )
         return child_run
 

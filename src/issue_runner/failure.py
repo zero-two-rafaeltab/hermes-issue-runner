@@ -30,6 +30,8 @@ class FailureRecoveryRequest:
     child_issue: str
     failure_summary: str
     thread_url: str | None = None
+    failure_event: Any | None = None
+    failure_source: Any | None = None
     attempt: int = 1
 
 
@@ -91,6 +93,67 @@ async def _authorized(auth_checker: Callable[[Any, Any], Any] | None, event: Any
     return bool(await _maybe_await(auth_checker(event, gateway)))
 
 
+def _failure_context_event(request: FailureRecoveryRequest, fallback_event: Any) -> Any:
+    if request.failure_event is not None:
+        return request.failure_event
+    if request.failure_source is not None:
+        text = getattr(fallback_event, "text", "")
+        return type("FailureRecoveryEvent", (), {"text": text, "source": request.failure_source})()
+    return fallback_event
+
+
+def _call_response_waiter(response_waiter: Callable[..., Any], **kwargs: Any) -> Any:
+    """Call the recovery waiter using a documented shape, with legacy support.
+
+    Preferred waiters accept keyword arguments including ``request``, ``event``,
+    ``gateway``, ``failure_source``, and ``thread_url``. Older adapters accepted
+    only positional ``(event, gateway)``; support that shape by inspecting the
+    callable signature rather than swallowing arbitrary ``TypeError`` raised
+    inside the waiter.
+    """
+
+    try:
+        signature = inspect.signature(response_waiter)
+    except (TypeError, ValueError):
+        return response_waiter(**kwargs)
+
+    parameters = list(signature.parameters.values())
+    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters):
+        return response_waiter(**kwargs)
+
+    keyword_arguments = {
+        name: value
+        for name, value in kwargs.items()
+        if name in signature.parameters
+        and signature.parameters[name].kind
+        in {inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY}
+    }
+    required_keyword_only = [
+        parameter
+        for parameter in parameters
+        if parameter.default is inspect.Parameter.empty
+        and parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        and parameter.name not in keyword_arguments
+    ]
+    if keyword_arguments or not required_keyword_only:
+        try:
+            signature.bind_partial(**keyword_arguments)
+        except TypeError:
+            pass
+        else:
+            return response_waiter(**keyword_arguments)
+
+    positional_parameters = [
+        parameter
+        for parameter in parameters
+        if parameter.kind in {inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD}
+    ]
+    if any(parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in parameters) or len(positional_parameters) >= 2:
+        return response_waiter(kwargs["event"], kwargs["gateway"])
+
+    return response_waiter(**keyword_arguments)
+
+
 async def wait_for_recovery_decision(
     *,
     request: FailureRecoveryRequest,
@@ -108,13 +171,18 @@ async def wait_for_recovery_decision(
     function intentionally does not pass a timeout.
     """
 
-    await _maybe_await(prompt_sender(event, gateway, format_failure_prompt(request)))
+    context_event = _failure_context_event(request, event)
+    await _maybe_await(prompt_sender(context_event, gateway, format_failure_prompt(request)))
 
     while True:
-        try:
-            candidate = response_waiter(request=request, event=event, gateway=gateway)
-        except TypeError:
-            candidate = response_waiter(event, gateway)
+        candidate = _call_response_waiter(
+            response_waiter,
+            request=request,
+            event=context_event,
+            gateway=gateway,
+            failure_source=request.failure_source,
+            thread_url=request.thread_url,
+        )
         reply_event = await _maybe_await(candidate)
         if reply_event is None:
             continue
