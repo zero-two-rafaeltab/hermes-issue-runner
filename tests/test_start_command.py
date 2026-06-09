@@ -407,7 +407,7 @@ class StartCommandTests(unittest.TestCase):
         self.assertIn("Parent nous/hermes-issue-runner#1 is complete", replies[0])
         self.assertIn("Completed child runs: #8.", replies[0])
 
-    def test_branch_preparation_failure_cleans_up_reserved_child_label(self) -> None:
+    def test_branch_preparation_failure_preserves_reserved_child_label(self) -> None:
         github = FakeGitHub()
         replies: list[str] = []
 
@@ -435,7 +435,7 @@ class StartCommandTests(unittest.TestCase):
         self.assertIn("recovery waiting is not configured", replies[0])
         self.assertIn("rerun manually or configure", replies[0])
 
-    def test_child_session_failure_cleans_up_reserved_child_label(self) -> None:
+    def test_child_session_failure_preserves_reserved_child_label(self) -> None:
         github = FakeGitHub()
         replies: list[str] = []
 

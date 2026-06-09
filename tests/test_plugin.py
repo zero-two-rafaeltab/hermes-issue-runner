@@ -70,6 +70,26 @@ class IssueRunnerPluginTests(unittest.TestCase):
     def test_plugin_imports_public_issue_runner_package(self) -> None:
         self.assertIs(plugin.StartCommandHandler, issue_runner.start.StartCommandHandler)
 
+    def test_plugin_package_mirrors_src_modules(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        src_package_dir = repo_root / "src" / "issue_runner"
+        repo_plugin_dir = repo_root / "plugins" / "issue_runner"
+        mirrored_modules = [
+            "branch_prep.py",
+            "child_run.py",
+            "failure.py",
+            "selection.py",
+            "start.py",
+            "state.py",
+        ]
+
+        for module_name in mirrored_modules:
+            with self.subTest(module=module_name):
+                self.assertEqual(
+                    (repo_plugin_dir / module_name).read_bytes(),
+                    (src_package_dir / module_name).read_bytes(),
+                )
+
     def test_plugin_imports_when_copied_without_repo_src(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         repo_plugin_dir = repo_root / "plugins" / "issue_runner"
@@ -276,6 +296,88 @@ class IssueRunnerPluginTests(unittest.TestCase):
         self.assertEqual(github.remove_label_calls, [])
         self.assertEqual(len(replies), 1)
         self.assertIn("exactly one word", replies[0])
+
+
+    def test_standalone_plugin_routes_failure_recovery_to_failed_attempt_thread(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        repo_plugin_dir = repo_root / "plugins" / "issue_runner"
+        original_path = list(sys.path)
+        original_modules = {
+            name: module
+            for name, module in sys.modules.items()
+            if name == "issue_runner" or name.startswith("issue_runner.")
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_parent = Path(temp_dir)
+            shutil.copytree(repo_plugin_dir, temp_parent / "issue_runner")
+            for name in list(sys.modules):
+                if name == "issue_runner" or name.startswith("issue_runner."):
+                    sys.modules.pop(name)
+            sys.path[:] = [str(temp_parent)] + [
+                entry
+                for entry in original_path
+                if entry and not Path(entry).resolve().is_relative_to(repo_root)
+            ]
+            try:
+                standalone_start = importlib.import_module("issue_runner.start")
+
+                github = FakeGitHub()
+                parent_event = self._event("/issue-runner start nous/hermes-issue-runner#3", user_id="u1")
+                failure_source = SimpleNamespace(
+                    platform=SimpleNamespace(value="discord"),
+                    chat_id="failure-thread",
+                    thread_id="attempt-1",
+                    user_id="child-agent",
+                )
+                failure_event = SimpleNamespace(text="child failed", source=failure_source)
+                prompt_events: list[SimpleNamespace] = []
+                prompt_messages: list[str] = []
+                response_events = iter([
+                    self._event("retry please", user_id="u1"),
+                    self._event("stop", user_id="intruder"),
+                    self._event("stop", user_id="u1"),
+                ])
+
+                async def reply_sender(event, gateway, message):
+                    prompt_events.append(event)
+                    prompt_messages.append(message)
+
+                async def recovery_response_waiter(**kwargs):
+                    self.assertIs(kwargs["event"], failure_event)
+                    self.assertIs(kwargs["failure_source"], failure_source)
+                    self.assertEqual(kwargs["thread_url"], "https://discord.test/failure-thread")
+                    return next(response_events)
+
+                async def child_session_starter(**kwargs):
+                    return {
+                        "status": "failed",
+                        "failure_event": failure_event,
+                        "failure_thread_url": "https://discord.test/failure-thread",
+                    }
+
+                handler = standalone_start.StartCommandHandler(
+                    github_client=github,
+                    authorization_checker=lambda event, gateway: event.source.user_id == "u1",
+                    reply_sender=reply_sender,
+                    child_session_starter=child_session_starter,
+                    recovery_response_waiter=recovery_response_waiter,
+                )
+
+                result = asyncio.run(handler.handle(parent_event, SimpleNamespace()))
+            finally:
+                for name in list(sys.modules):
+                    if name == "issue_runner" or name.startswith("issue_runner."):
+                        sys.modules.pop(name)
+                sys.modules.update(original_modules)
+                sys.path[:] = original_path
+
+        self.assertEqual(result, {"action": "skip", "reason": "failure recovery: stop"})
+        self.assertEqual(prompt_events, [failure_event])
+        self.assertIn("exactly one word", prompt_messages[0])
+        self.assertIn("https://discord.test/failure-thread", prompt_messages[0])
+        self.assertEqual(github.add_label_calls, [("nous", "hermes-issue-runner", 4, "agent:in-progress")])
+        self.assertEqual(github.remove_label_calls, [])
 
     def test_unconfigured_github_client_returns_actionable_error(self) -> None:
         replies: list[str] = []

@@ -136,12 +136,8 @@ def _call_response_waiter(response_waiter: Callable[..., Any], **kwargs: Any) ->
         and parameter.name not in keyword_arguments
     ]
     if keyword_arguments or not required_keyword_only:
-        try:
-            signature.bind_partial(**keyword_arguments)
-        except TypeError:
-            pass
-        else:
-            return response_waiter(**keyword_arguments)
+        signature.bind_partial(**keyword_arguments)
+        return response_waiter(**keyword_arguments)
 
     positional_parameters = [
         parameter
