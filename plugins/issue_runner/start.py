@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 from .branch_prep import plan_branch_preparation
 from .child_run import prepare_child_run, start_child_issue_session
 from .failure import FailureRecoveryRequest, wait_for_recovery_decision
+from .retry import close_superseded_failed_prs, plan_retry_attempt
 from .selection import IssueKey, select_next_child
 from .state import check_duplicate_run, ensure_operational_labels, mark_child_done, mark_child_started
 
@@ -483,6 +484,7 @@ class StartCommandHandler:
         self.child_session_starter = child_session_starter or start_child_issue_session
         self.branch_preparer = branch_preparer or plan_branch_preparation
         self.recovery_response_waiter = recovery_response_waiter
+        self._attempt_overrides: dict[IssueKey, int] = {}
 
     async def handle(self, event: Any, gateway: Any) -> dict[str, str] | None:
         if _platform_value(event) != "discord":
@@ -615,12 +617,21 @@ class StartCommandHandler:
                         failure_source=exc.failure_source,
                         thread_url=exc.thread_url,
                     ) from exc
+                if exc.child is not None:
+                    retry_plan = await plan_retry_attempt(
+                        child=exc.child,
+                        github_client=self.github_client,
+                        failed_thread_url=exc.thread_url,
+                    )
+                    self._attempt_overrides[exc.child.key] = retry_plan.attempt
+                    await close_superseded_failed_prs(retry_plan, self.github_client)
 
     async def _select_next_child(self, parent: ParentIssue) -> Any:
         return await select_next_child(IssueKey(parent.owner, parent.repo, parent.number), self.github_client)
 
     async def _start_selected_child(self, *, event: Any, gateway: Any, parent_key: IssueKey, child: Any) -> Any:
-        prepared_plan = prepare_child_run(parent=parent_key, child=child)
+        attempt = self._attempt_overrides.get(child.key, 1)
+        prepared_plan = prepare_child_run(parent=parent_key, child=child, attempt=attempt)
         await _maybe_await(mark_child_started(child, self.github_client))
         try:
             branch_preparation = await _maybe_await(
@@ -653,6 +664,7 @@ class StartCommandHandler:
                     base_branch=branch_preparation.base_branch,
                     pr_base=branch_preparation.pr_base,
                     branch_preparation=branch_preparation,
+                    attempt=attempt,
                 )
             )
         except Exception as exc:
