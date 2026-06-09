@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 import sys
 import unittest
@@ -86,7 +87,7 @@ Mentions #99 here do not count.
                 child(11, labels=[{"name": "ready-for-agent"}]),
             ]
         )
-        selection = select_next_child(IssueKey("nous", "runner", 1), github)
+        selection = asyncio.run(select_next_child(IssueKey("nous", "runner", 1), github))
         self.assertEqual(selection.status, "runnable")
         self.assertIsNotNone(selection.selected)
         assert selection.selected is not None
@@ -106,7 +107,7 @@ Mentions #99 here do not count.
                 ("ext", "repo", 4): issue("ext", "repo", 4, labels=["agent:done"]),
             },
         )
-        selection = select_next_child(IssueKey("nous", "runner", 1), github)
+        selection = asyncio.run(select_next_child(IssueKey("nous", "runner", 1), github))
         self.assertEqual(selection.status, "runnable")
         self.assertEqual(selection.selected.number, 5)  # type: ignore[union-attr]
         self.assertEqual(github.issue_calls, [("nous", "runner", 3), ("ext", "repo", 4)])
@@ -119,7 +120,7 @@ Mentions #99 here do not count.
             ],
             {("nous", "runner", 9): issue("nous", "runner", 9)},
         )
-        selection = select_next_child(IssueKey("nous", "runner", 1), github)
+        selection = asyncio.run(select_next_child(IssueKey("nous", "runner", 1), github))
         self.assertEqual(selection.status, "runnable")
         self.assertEqual(selection.selected.number, 3)  # type: ignore[union-attr]
         self.assertEqual(selection.blocked[0].child.number, 2)
@@ -130,7 +131,7 @@ Mentions #99 here do not count.
             [child(2, labels=["ready-for-agent"], body="## Blocked by\n- #9\n")],
             {("nous", "runner", 9): issue("nous", "runner", 9)},
         )
-        selection = select_next_child(IssueKey("nous", "runner", 1), github)
+        selection = asyncio.run(select_next_child(IssueKey("nous", "runner", 1), github))
         self.assertEqual(selection.status, "waiting_on_blockers")
         self.assertIsNone(selection.selected)
         self.assertIn("waiting on blockers", selection.message)
@@ -143,13 +144,35 @@ Mentions #99 here do not count.
                 child(3, labels=["ready-for-agent", "agent:done"]),
             ]
         )
-        selection = select_next_child(IssueKey("nous", "runner", 1), github)
+        selection = asyncio.run(select_next_child(IssueKey("nous", "runner", 1), github))
         self.assertEqual(selection.status, "complete")
         self.assertIn("complete", selection.message)
 
+    def test_async_child_listing_and_blocker_lookup_are_awaited(self) -> None:
+        body = "## Blocked by\n- #4\n"
+
+        class AsyncGitHub(FakeGitHub):
+            async def list_child_issues(self, owner: str, repo: str, parent_number: int):  # type: ignore[override]
+                self.child_calls.append((owner, repo, parent_number))
+                return self.children
+
+            async def get_issue(self, owner: str, repo: str, number: int):  # type: ignore[override]
+                self.issue_calls.append((owner, repo, number))
+                return self.issues[(owner, repo, number)]
+
+        github = AsyncGitHub(
+            [child(2, labels=["ready-for-agent"], body=body)],
+            {("nous", "runner", 4): issue("nous", "runner", 4, labels=["agent:done"])},
+        )
+        selection = asyncio.run(select_next_child(IssueKey("nous", "runner", 1), github))
+        self.assertEqual(selection.status, "runnable")
+        self.assertEqual(selection.selected.number, 2)  # type: ignore[union-attr]
+        self.assertEqual(github.child_calls, [("nous", "runner", 1)])
+        self.assertEqual(github.issue_calls, [("nous", "runner", 4)])
+
     def test_reports_waiting_for_triage_when_children_are_not_ready(self) -> None:
         github = FakeGitHub([child(2, labels=["needs-human"]), child(3, labels=[])])
-        selection = select_next_child(IssueKey("nous", "runner", 1), github)
+        selection = asyncio.run(select_next_child(IssueKey("nous", "runner", 1), github))
         self.assertEqual(selection.status, "waiting_for_triage")
         self.assertIn("ready-for-agent", selection.message)
 

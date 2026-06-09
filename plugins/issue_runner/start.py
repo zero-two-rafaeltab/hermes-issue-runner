@@ -14,6 +14,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from .selection import IssueKey, select_next_child
+from .state import check_duplicate_run, ensure_operational_labels, mark_child_done, mark_child_started
 
 SLASH_COMMANDS = ("/issue-runner", "/issue_runner")
 START_WORD_RE = re.compile(r"\b(?:start|run|begin)\b", re.IGNORECASE)
@@ -286,7 +287,16 @@ class StartCommandHandler:
         try:
             issue_payload = await _maybe_await(self._get_issue(command.reference))
             parent = _coerce_parent_issue(command.reference, issue_payload)
-            selection = await _maybe_await(self._select_next_child(parent))
+            parent_key = IssueKey(parent.owner, parent.repo, parent.number)
+            await _maybe_await(ensure_operational_labels(parent.owner, parent.repo, self.github_client))
+            duplicate_guard = await check_duplicate_run(parent_key, self.github_client)
+            if duplicate_guard.has_incomplete_state:
+                await _maybe_await(self.reply_sender(event, gateway, duplicate_guard.message))
+                return {"action": "skip", "reason": "duplicate run in progress"}
+            selection = await self._select_next_child(parent)
+            if selection.has_runnable_child:
+                assert selection.selected is not None
+                await _maybe_await(mark_child_started(selection.selected, self.github_client))
         except Exception as exc:
             await _maybe_await(
                 self.reply_sender(
@@ -326,5 +336,10 @@ class StartCommandHandler:
             return self.github_client(reference.owner, reference.repo, reference.number)
         raise TypeError("github_client must be callable or expose get_issue(owner, repo, number)")
 
-    def _select_next_child(self, parent: ParentIssue) -> Any:
-        return select_next_child(IssueKey(parent.owner, parent.repo, parent.number), self.github_client)
+    async def _select_next_child(self, parent: ParentIssue) -> Any:
+        return await select_next_child(IssueKey(parent.owner, parent.repo, parent.number), self.github_client)
+
+    async def complete_child(self, child: IssueKey) -> None:
+        """Mark a successfully completed child done through the operational state model."""
+
+        await _maybe_await(mark_child_done(child, self.github_client))
