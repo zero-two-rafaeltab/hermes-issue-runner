@@ -2,7 +2,7 @@
 
 A Hermes gateway plugin for running GitHub sub-issues through auditable agent implementation workflows from Discord.
 
-This repository currently contains the issue #2 technical spike artifact, the first minimal issue-runner start command surface for Discord, and issue #4 child discovery/selection behavior for ready child issues and blockers.
+This repository contains the issue #2 technical spike artifact and an incremental issue-runner prototype: Discord command handling, GitHub child discovery/selection, operational label state, branch preparation, child-session launch prompts, and parent-run resume/continuation behavior.
 
 ## Spike #2 result
 
@@ -39,6 +39,32 @@ It also recognizes mention-oriented natural language, for example:
 ```text
 @Hermes start issue runner for owner/repo#1
 ```
+
+A started parent run re-selects children from current GitHub state. It starts the
+next unblocked child labeled `ready-for-agent`, reserves that child with
+`agent:in-progress` before branch/session setup, then launches one gateway child
+session. If a controlled child-session adapter explicitly reports completion
+(`agent:done`, `completed_child_issue`, or equivalent), the parent loop marks that
+child `agent:done`, removes `agent:in-progress`, re-fetches GitHub state, and
+advances to the next runnable child. Normal gateway scheduling acknowledgements do
+not auto-advance; the operator should resume after the child finishes.
+
+Resume/continue commands are live Discord continuations that use the same handler
+path and reply formatting as start:
+
+```text
+/issue-runner resume owner/repo#1
+/issue-runner continue owner/repo#1
+@Hermes continue issue runner for owner/repo#1
+```
+
+Operational labels:
+
+- `ready-for-agent` — child issue is eligible for selection.
+- `agent:in-progress` — child issue is reserved/running; duplicate parent starts
+  are refused while any child has this label. The handler cleans this label up on
+  branch preparation or child-session startup failure.
+- `agent:done` — child issue is complete; blockers referencing it are satisfied.
 
 The handler reuses Hermes Discord authorization through the injected gateway
 authorization predicate (for example `_is_user_authorized`) and requires an

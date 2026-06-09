@@ -104,6 +104,17 @@ class OperationalStateTests(unittest.TestCase):
         self.assertEqual(github.remove_calls, [("nous", "runner", 5, "agent:in-progress")])
         self.assertEqual(github.add_calls, [("nous", "runner", 5, "agent:done")])
 
+    def test_mark_child_done_is_harmless_when_in_progress_label_absent(self) -> None:
+        class MissingLabelGitHub(FakeGitHub):
+            def remove_issue_label(self, owner: str, repo: str, number: int, label: str) -> None:  # type: ignore[override]
+                self.remove_calls.append((owner, repo, number, label))
+                raise RuntimeError("label not found")
+
+        github = MissingLabelGitHub()
+        asyncio.run(mark_child_done(IssueKey("nous", "runner", 5), github))
+        self.assertEqual(github.remove_calls, [("nous", "runner", 5, "agent:in-progress")])
+        self.assertEqual(github.add_calls, [("nous", "runner", 5, "agent:done")])
+
     def test_async_label_adapter_methods_are_awaited(self) -> None:
         class AsyncGitHub(FakeGitHub):
             async def ensure_label(self, owner: str, repo: str, label: str) -> None:  # type: ignore[override]
