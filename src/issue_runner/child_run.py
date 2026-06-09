@@ -37,6 +37,7 @@ class ChildRunPlan:
     title: str
     prompt: str
     branch_preparation: BranchPreparationPlan | None = None
+    attempt: int = 1
 
 
 @dataclass(frozen=True)
@@ -54,10 +55,17 @@ def issue_branch_slug(title: str, *, max_words: int = 7) -> str:
     return "-".join(words) or "issue"
 
 
-def issue_branch_name(child: GitHubIssue) -> str:
-    """Return the clean first-attempt branch name for a child issue."""
+def issue_branch_name(child: GitHubIssue, *, attempt: int = 1) -> str:
+    """Return the deterministic branch name for a child issue attempt."""
 
-    return f"feat/issue-{child.number}-{issue_branch_slug(child.title)}"
+    branch = f"feat/issue-{child.number}-{issue_branch_slug(child.title)}"
+    if attempt < 1:
+        raise ValueError("attempt must be >= 1")
+    if attempt == 1:
+        return branch
+    if attempt == 2:
+        return f"{branch}-retry"
+    return f"{branch}-retry-{attempt - 1}"
 
 
 def _branch_setup_text(
@@ -177,10 +185,11 @@ def prepare_child_run(
     base_branch: str = "main",
     pr_base: str = "main",
     branch_preparation: BranchPreparationPlan | None = None,
+    attempt: int = 1,
 ) -> ChildRunPlan:
     """Prepare deterministic child-run metadata and prompt."""
 
-    branch = issue_branch_name(child)
+    branch = issue_branch_name(child, attempt=attempt)
     if branch_preparation is not None:
         base_branch = branch_preparation.base_branch
         pr_base = branch_preparation.pr_base
@@ -191,7 +200,7 @@ def prepare_child_run(
         branch_name=branch,
         base_branch=base_branch,
         pr_base=pr_base,
-        idempotency_key=f"github:{child.repository}/issues/{child.number}:attempt:1",
+        idempotency_key=f"github:{child.repository}/issues/{child.number}:attempt:{attempt}",
         title=title,
         prompt=build_auditable_child_prompt(
             parent=parent,
@@ -202,6 +211,7 @@ def prepare_child_run(
             branch_preparation=branch_preparation,
         ),
         branch_preparation=branch_preparation,
+        attempt=attempt,
     )
 
 
@@ -218,6 +228,7 @@ def _request_payload(event: Any, plan: ChildRunPlan) -> dict[str, Any]:
             "branch": plan.branch_name,
             "base_branch": plan.base_branch,
             "pr_base": plan.pr_base,
+            "attempt": plan.attempt,
         },
     }
 
@@ -231,6 +242,7 @@ async def start_child_issue_session(
     base_branch: str = "main",
     pr_base: str = "main",
     branch_preparation: BranchPreparationPlan | None = None,
+    attempt: int = 1,
 ) -> ChildRunStart:
     """Start a gateway-native child session for one selected issue.
 
@@ -249,6 +261,7 @@ async def start_child_issue_session(
         base_branch=base_branch,
         pr_base=pr_base,
         branch_preparation=branch_preparation,
+        attempt=attempt,
     )
     payload = _request_payload(event, plan)
     factory = getattr(gateway, "child_session_request_factory", None)
