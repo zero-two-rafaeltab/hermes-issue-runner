@@ -129,6 +129,7 @@ class IssueRunnerPluginTests(unittest.TestCase):
     def test_register_uses_injected_github_and_auth_seams(self) -> None:
         github = FakeGitHub()
         hooks: list[tuple[str, object]] = []
+        commands: list[tuple[str, object, str, str]] = []
         replies: list[str] = []
 
         async def send(chat_id, content, metadata=None):
@@ -138,6 +139,7 @@ class IssueRunnerPluginTests(unittest.TestCase):
             github_client=github,
             authorization_checker=lambda event, gateway: True,
             register_hook=lambda name, hook: hooks.append((name, hook)),
+            register_command=lambda name, handler, description="", args_hint="": commands.append((name, handler, description, args_hint)),
         )
         async def start_child_session(request):
             return {"scheduled": True, "request": request}
@@ -145,7 +147,11 @@ class IssueRunnerPluginTests(unittest.TestCase):
         gateway = SimpleNamespace(adapters={"discord": SimpleNamespace(send=send)}, start_child_session=start_child_session)
 
         plugin.register(ctx)
-        self.assertEqual(hooks, [("pre_gateway_dispatch", plugin.pre_gateway_dispatch)])
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0][0], "issue-runner")
+        self.assertIn("GitHub parent issues", commands[0][2])
+        self.assertEqual(commands[0][3], "start owner/repo#123")
+        self.assertEqual(hooks, [("pre_gateway_dispatch", plugin.pre_gateway_dispatch_hook)])
 
         result = asyncio.run(plugin.pre_gateway_dispatch(self._event("/issue-runner start nous/hermes-issue-runner#3"), gateway))
         self.assertEqual(result, {"action": "skip", "reason": "issue-runner child run started", "child": "4"})
@@ -173,6 +179,7 @@ class IssueRunnerPluginTests(unittest.TestCase):
                     github_client=github,
                     authorization_checker=lambda event, gateway: True,
                     register_hook=lambda name, hook: hooks.append((name, hook)),
+                    register_command=lambda *args, **kwargs: None,
                 )
 
                 async def start_child_session(request):
@@ -184,7 +191,7 @@ class IssueRunnerPluginTests(unittest.TestCase):
                 result = asyncio.run(plugin.pre_gateway_dispatch(self._event(f"/issue-runner {verb} nous/hermes-issue-runner#2"), gateway))
 
                 self.assertEqual(result, {"action": "skip", "reason": "issue-runner child run started", "child": "4"})
-                self.assertEqual(hooks, [("pre_gateway_dispatch", plugin.pre_gateway_dispatch)])
+                self.assertEqual(hooks, [("pre_gateway_dispatch", plugin.pre_gateway_dispatch_hook)])
                 self.assertEqual(github.add_label_calls, [("nous", "hermes-issue-runner", 4, "agent:in-progress")])
                 self.assertIn("Repository: nous/hermes-issue-runner", replies[0])
                 self.assertIn("started gateway child session for #4", replies[0])
@@ -245,6 +252,7 @@ class IssueRunnerPluginTests(unittest.TestCase):
             authorization_checker=lambda event, gateway: event.source.user_id == "u1",
             issue_runner_recovery_response_waiter=recovery_response_waiter,
             register_hook=lambda name, hook: hooks.append((name, hook)),
+            register_command=lambda *args, **kwargs: None,
         )
 
         async def start_child_session(request):
@@ -260,7 +268,7 @@ class IssueRunnerPluginTests(unittest.TestCase):
         result = asyncio.run(plugin.pre_gateway_dispatch(self._event("/issue-runner start nous/hermes-issue-runner#3"), gateway))
 
         self.assertEqual(result, {"action": "skip", "reason": "issue-runner child run started", "child": "4"})
-        self.assertEqual(hooks, [("pre_gateway_dispatch", plugin.pre_gateway_dispatch)])
+        self.assertEqual(hooks, [("pre_gateway_dispatch", plugin.pre_gateway_dispatch_hook)])
         self.assertEqual(attempts, 2)
         self.assertIn("gateway start failed once", replies[0])
         self.assertIn("started gateway child session", replies[1])
@@ -281,6 +289,7 @@ class IssueRunnerPluginTests(unittest.TestCase):
             authorization_checker=lambda event, gateway: event.source.user_id == "u1",
             recovery_response_waiter=recovery_response_waiter,
             register_hook=lambda name, hook: None,
+            register_command=lambda *args, **kwargs: None,
         )
 
         async def start_child_session(request):
@@ -386,8 +395,10 @@ class IssueRunnerPluginTests(unittest.TestCase):
             replies.append(content)
 
         ctx = SimpleNamespace(
+            issue_runner_github_client=plugin.UnconfiguredGitHubClient(),
             authorization_checker=lambda event, gateway: True,
             register_hook=lambda name, hook: None,
+            register_command=lambda *args, **kwargs: None,
         )
         gateway = SimpleNamespace(adapters={"discord": SimpleNamespace(send=send)})
 

@@ -475,6 +475,7 @@ class StartCommandHandler:
         child_session_starter: Callable[..., Any] | None = None,
         branch_preparer: Callable[..., Any] | None = None,
         recovery_response_waiter: Callable[..., Any] | None = None,
+        child_completion_waiter: Callable[..., Any] | None = None,
         git_client: Any | None = None,
     ) -> None:
         self.github_client = github_client
@@ -484,6 +485,7 @@ class StartCommandHandler:
         self.child_session_starter = child_session_starter or start_child_issue_session
         self.branch_preparer = branch_preparer or plan_branch_preparation
         self.recovery_response_waiter = recovery_response_waiter
+        self.child_completion_waiter = child_completion_waiter
         self._attempt_overrides: dict[IssueKey, int] = {}
 
     async def handle(self, event: Any, gateway: Any) -> dict[str, str] | None:
@@ -737,7 +739,20 @@ class StartCommandHandler:
             )
             started_runs.append(child_run)
             if not _child_run_completed(child_run):
-                return ParentRunResult(parent_key, selection, tuple(started_runs), tuple(completed_children))
+                if self.child_completion_waiter is None:
+                    return ParentRunResult(parent_key, selection, tuple(started_runs), tuple(completed_children))
+                completion = await _maybe_await(
+                    self.child_completion_waiter(
+                        event=event,
+                        gateway=gateway,
+                        parent=parent_key,
+                        child=selection.selected,
+                        child_run=child_run,
+                        github_client=self.github_client,
+                    )
+                )
+                if not _truthy_status(completion):
+                    return ParentRunResult(parent_key, selection, tuple(started_runs), tuple(completed_children))
             await _maybe_await(mark_child_done(selection.selected, self.github_client))
             completed_children.append(selection.selected.key)
         raise RuntimeError("Parent run loop exceeded 100 child iterations without reaching a stable state")

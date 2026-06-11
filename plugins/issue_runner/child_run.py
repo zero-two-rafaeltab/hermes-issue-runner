@@ -218,8 +218,8 @@ def prepare_child_run(
 def _request_payload(event: Any, plan: ChildRunPlan) -> dict[str, Any]:
     return {
         "parent_event": event,
-        "title": plan.title,
-        "prompt": plan.prompt,
+        "child_title": plan.title,
+        "starter_prompt": plan.prompt,
         "idempotency_key": plan.idempotency_key,
         "metadata": {
             "source": "hermes-issue-runner",
@@ -231,6 +231,29 @@ def _request_payload(event: Any, plan: ChildRunPlan) -> dict[str, Any]:
             "attempt": plan.attempt,
         },
     }
+
+
+def _coerce_child_session_request(gateway: Any, payload: dict[str, Any]) -> Any:
+    """Return the object expected by Hermes core's child-session seam.
+
+    Hermes core now validates that ``start_child_session`` receives an actual
+    ``GatewayChildSessionRequest`` instance, not a plain dict. Keep the older
+    injected factory hook for tests/adapters, but construct the public dataclass
+    directly when it is importable in the gateway process.
+    """
+
+    factory = getattr(gateway, "child_session_request_factory", None)
+    if callable(factory):
+        return factory(**payload)
+
+    try:
+        from gateway.child_session import GatewayChildSessionRequest
+    except Exception:
+        # Unit tests and older Hermes cores may not have the public seam type on
+        # sys.path. Preserve the old dict fallback for those environments.
+        return payload
+
+    return GatewayChildSessionRequest(**payload)
 
 
 async def start_child_issue_session(
@@ -246,9 +269,9 @@ async def start_child_issue_session(
 ) -> ChildRunStart:
     """Start a gateway-native child session for one selected issue.
 
-    The preferred seam is ``gateway.start_child_session(request)``. Tests or
-    adapters may also expose ``gateway.child_session_request_factory`` to coerce
-    the dictionary payload into Hermes core's request dataclass.
+    The preferred seam is ``gateway.start_child_session(request)``. Tests or adapters
+    may also expose ``gateway.child_session_request_factory`` to coerce the
+    dictionary payload into Hermes core's request dataclass.
     """
 
     starter = getattr(gateway, "start_child_session", None)
@@ -264,7 +287,6 @@ async def start_child_issue_session(
         attempt=attempt,
     )
     payload = _request_payload(event, plan)
-    factory = getattr(gateway, "child_session_request_factory", None)
-    request = factory(**payload) if callable(factory) else payload
+    request = _coerce_child_session_request(gateway, payload)
     result = await _maybe_await(starter(request))
     return ChildRunStart(plan=plan, result=result)

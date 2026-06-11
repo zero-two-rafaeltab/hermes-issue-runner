@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 import sys
+import types
 from types import SimpleNamespace
 import unittest
 
@@ -57,6 +58,59 @@ class ChildRunTests(unittest.TestCase):
             calls.append(request)
             return {"scheduled": True, "thread_id": "t1"}
 
+        gateway = SimpleNamespace(
+            start_child_session=start_child_session,
+            child_session_request_factory=lambda **kwargs: kwargs,
+        )
+        result = asyncio.run(
+            start_child_issue_session(
+                gateway=gateway,
+                event=SimpleNamespace(source="discord"),
+                parent=self._parent(),
+                child=self._child(),
+            )
+        )
+
+        self.assertEqual(result.result, {"scheduled": True, "thread_id": "t1"})
+        self.assertEqual(len(calls), 1)
+        request = calls[0]
+        self.assertEqual(request["child_title"], result.plan.title)
+        self.assertEqual(request["idempotency_key"], result.plan.idempotency_key)
+        self.assertEqual(request["metadata"]["source"], "hermes-issue-runner")
+        self.assertEqual(request["metadata"]["child_issue"], "zero-two-rafaeltab/hermes-issue-runner#6")
+        self.assertIn("auditable-implementation-review-loop", request["starter_prompt"])
+
+    def test_start_child_issue_session_builds_gateway_request_when_available(self) -> None:
+        calls = []
+
+        class GatewayChildSessionRequest:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        gateway_module = types.ModuleType("gateway")
+        child_session_module = types.ModuleType("gateway.child_session")
+        child_session_module.GatewayChildSessionRequest = GatewayChildSessionRequest
+        old_gateway = sys.modules.get("gateway")
+        old_child_session = sys.modules.get("gateway.child_session")
+        sys.modules["gateway"] = gateway_module
+        sys.modules["gateway.child_session"] = child_session_module
+
+        def restore_modules() -> None:
+            if old_gateway is None:
+                sys.modules.pop("gateway", None)
+            else:
+                sys.modules["gateway"] = old_gateway
+            if old_child_session is None:
+                sys.modules.pop("gateway.child_session", None)
+            else:
+                sys.modules["gateway.child_session"] = old_child_session
+
+        self.addCleanup(restore_modules)
+
+        async def start_child_session(request):
+            calls.append(request)
+            return {"scheduled": True, "thread_id": "t1"}
+
         gateway = SimpleNamespace(start_child_session=start_child_session)
         result = asyncio.run(
             start_child_issue_session(
@@ -70,11 +124,12 @@ class ChildRunTests(unittest.TestCase):
         self.assertEqual(result.result, {"scheduled": True, "thread_id": "t1"})
         self.assertEqual(len(calls), 1)
         request = calls[0]
-        self.assertEqual(request["title"], result.plan.title)
-        self.assertEqual(request["idempotency_key"], result.plan.idempotency_key)
-        self.assertEqual(request["metadata"]["source"], "hermes-issue-runner")
-        self.assertEqual(request["metadata"]["child_issue"], "zero-two-rafaeltab/hermes-issue-runner#6")
-        self.assertIn("auditable-implementation-review-loop", request["prompt"])
+        self.assertIsInstance(request, GatewayChildSessionRequest)
+        self.assertEqual(request.child_title, result.plan.title)
+        self.assertEqual(request.idempotency_key, result.plan.idempotency_key)
+        self.assertEqual(request.metadata["source"], "hermes-issue-runner")
+        self.assertEqual(request.metadata["child_issue"], "zero-two-rafaeltab/hermes-issue-runner#6")
+        self.assertIn("auditable-implementation-review-loop", request.starter_prompt)
 
     def test_start_child_issue_session_requires_gateway_seam(self) -> None:
         with self.assertRaisesRegex(TypeError, "start_child_session"):

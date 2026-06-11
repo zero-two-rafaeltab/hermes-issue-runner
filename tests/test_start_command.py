@@ -294,6 +294,47 @@ class StartCommandTests(unittest.TestCase):
         self.assertEqual(github.add_label_calls, [("nous", "hermes-issue-runner", 8, "agent:in-progress")])
         self.assertNotIn("Completed child runs", replies[0])
 
+    def test_completion_waiter_advances_after_gateway_ack_when_child_becomes_done(self) -> None:
+        github = FakeGitHub()
+        github.children = [
+            {"owner": "nous", "repo": "hermes-issue-runner", "number": 8, "title": "First", "body": "", "state": "open", "labels": ["ready-for-agent"]},
+            {"owner": "nous", "repo": "hermes-issue-runner", "number": 9, "title": "Second", "body": "", "state": "open", "labels": ["ready-for-agent"]},
+        ]
+        replies: list[str] = []
+        started_children: list[int] = []
+        waited_children: list[int] = []
+
+        async def reply_sender(event, gateway, message: str) -> bool:
+            replies.append(message)
+            return True
+
+        async def child_session_starter(**kwargs):
+            started_children.append(kwargs["child"].number)
+            return {"success": True, "plan": prepare_child_run(parent=kwargs["parent"], child=kwargs["child"])}
+
+        async def child_completion_waiter(**kwargs):
+            waited_children.append(kwargs["child"].number)
+            if kwargs["child"].number == 8:
+                github.remove_issue_label("nous", "hermes-issue-runner", 8, "agent:in-progress")
+                github.add_issue_label("nous", "hermes-issue-runner", 8, "agent:done")
+                return True
+            return False
+
+        handler = StartCommandHandler(
+            github,
+            authorization_checker=lambda event, gateway: True,
+            reply_sender=reply_sender,
+            child_session_starter=child_session_starter,
+            child_completion_waiter=child_completion_waiter,
+        )
+        result = asyncio.run(handler.handle(self._event("/issue-runner start nous/hermes-issue-runner#1"), SimpleNamespace()))
+
+        self.assertEqual(result, {"action": "skip", "reason": "issue-runner child run started", "child": "9"})
+        self.assertEqual(started_children, [8, 9])
+        self.assertEqual(waited_children, [8, 9])
+        self.assertIn("Completed child runs: #8.", replies[0])
+        self.assertIn("started gateway child session for #9", replies[0])
+
     def test_resume_parent_re_fetches_github_state_and_starts_next_child(self) -> None:
         github = FakeGitHub()
         github.children = [
